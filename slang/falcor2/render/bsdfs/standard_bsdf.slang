@@ -49,6 +49,7 @@ public struct StandardBSDF : IBSDF, IDifferentiable
 
     public __init() { }
 
+    [Differentiable]
     public __init(const float3 wi, const StandardBSDFData data)
     {
         // Clamp artist/material controls before deriving lobe weights.

@@ -11,6 +11,7 @@ public struct LambertDiffuseBTDF : IBSDF, IDifferentiable
 
     public __init() { }
 
+    [Differentiable]
     public __init(float3 albedo) { this.albedo = albedo; }
 
 

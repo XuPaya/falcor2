@@ -39,6 +39,7 @@ public struct Frame : IDifferentiable
     // normal and tangent are both assumed to be normalized, but not necessarily orthonormal.
     // handedness is with respect to the UV tangent space, not the geometry orientation.
     [Differentiable]
+    [ForceInline]
     public __init(
         float3 normal,
         float3 tangent,
@@ -69,6 +70,7 @@ public struct Frame : IDifferentiable
     public float3 to_local(float3 w) { return float3(dot(tangent, w), dot(bitangent, w), dot(normal, w)); }
 
     [Differentiable]
+    [ForceInline]
     public float3 to_global(float3 w) { return w.x * tangent + w.y * bitangent + w.z * normal; }
 
     // Returns sign that gets applied to such that bitangent = cross(normal, tangent) * handedness_sign();

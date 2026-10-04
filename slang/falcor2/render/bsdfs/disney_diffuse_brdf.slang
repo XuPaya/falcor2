@@ -14,6 +14,7 @@ public struct DisneyDiffuseBRDF : IBSDF, IDifferentiable
 
     public __init() { }
 
+    [Differentiable]
     public __init(float3 albedo, float roughness)
     {
         this.albedo = albedo;

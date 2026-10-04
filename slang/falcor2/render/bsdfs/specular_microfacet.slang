@@ -15,6 +15,7 @@ public struct SpecularMicrofacetBRDF : IBSDF, IDifferentiable
 
     public __init() { }
 
+    [Differentiable]
     public __init(float3 albedo, float alpha, BSDFFlags active_lobes = BSDFFlags::none)
     {
         this.albedo = albedo;
@@ -133,6 +134,7 @@ public struct SpecularMicrofacetBSDF : IBSDF, IDifferentiable
 
     public __init() { }
 
+    [Differentiable]
     public __init(float3 transmission_albedo, float alpha, float eta, BSDFFlags active_lobes = BSDFFlags::none)
     {
         this.transmission_albedo = transmission_albedo;

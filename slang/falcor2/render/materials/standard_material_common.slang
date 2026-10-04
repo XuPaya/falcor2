@@ -9,6 +9,8 @@ bool is_normal_mapping_enabled(const MaterialInstanceHints hints)
     return !(hints & MaterialInstanceHints::disable_normal_mapping);
 }
 
+[Differentiable]
+[ForceInline]
 public float3 decode_normal_map(const float3 encoded)
 {
     float3 normal = encoded * 2.0 - 1.0;
@@ -32,7 +34,9 @@ float get_metallic(const float3 diffuse, const float3 specular)
     return saturate((root - b) * 12.5);
 }
 
-Frame orient_shading_frame(const SurfaceInteraction si, const Frame shading_frame_ws, const bool orient_backface)
+[Differentiable]
+[ForceInline]
+public Frame orient_shading_frame(const SurfaceInteraction si, const Frame shading_frame_ws, const bool orient_backface)
 {
     Frame result = shading_frame_ws;
     if (!si.front_facing && orient_backface)
@@ -40,7 +44,7 @@ Frame orient_shading_frame(const SurfaceInteraction si, const Frame shading_fram
     return result;
 }
 
-bool is_valid_hemisphere_reflection_or_transmission(
+public bool is_valid_hemisphere_reflection_or_transmission(
     const SurfaceInteraction si,
     const Frame shading_frame_ws,
     const float3 wi_ls,
