@@ -32,7 +32,8 @@ public extern static const bool has_openpbr;
 /// keeps the BSDF derivatives much cheaper.
 public extern static const bool normal_maps;
 public uint light_slot_base;
-public ParameterBlock<PowerLightSampler> light_sampler;
+public extern struct LightSampler : ILightSampler = PowerLightSampler;
+public ParameterBlock<LightSampler> light_sampler;
 
 /// Object-space vertex tangents and parameter tangents (forward mode).
 public StructuredBuffer<float3> vertex_tangent;

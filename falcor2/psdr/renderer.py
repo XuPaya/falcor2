@@ -20,7 +20,12 @@ from falcor2.psdr.openpbr import generate_openpbr_headers
 
 class PSDR:
     """Renders a falcor2 scene from a camera: the primal image, forward-mode derivative images and backward-mode
-    gradients (see falcor2.psdr)."""
+    gradients (see falcor2.psdr).
+
+    ``light_sampler`` chooses the lights of next-event estimation (default: f2.PowerLightSampler, as the reference
+    path tracer). Its emitted-power weights starve small lights next to a distant, physically large one (a sun
+    disk); f2.UniformLightSampler samples every light alike.
+    """
 
     def __init__(
         self,
@@ -31,6 +36,7 @@ class PSDR:
         ray_epsilon: Optional[float] = None,
         photon_radius: Optional[float] = None,
         check_visibility: bool = False,
+        light_sampler: Optional[f2.LightSampler] = None,
     ):
         if not 0 <= max_bounces <= MAX_DEPTH:
             raise ValueError(f"max_bounces must be in [0, {MAX_DEPTH}]")
@@ -43,12 +49,14 @@ class PSDR:
         module = self._helper.get_module(scene, "falcor2.psdr.psdr")
         conformances = scene.requirements.type_conformances
         type_ids = {c.type_name: c.id for c in conformances if c.interface_name == "IMaterial"}
-        self._light_sampler = f2.PowerLightSampler()
+        self._light_sampler = light_sampler or f2.PowerLightSampler()
+        prelude = (self._light_sampler.shader_specialization_source
+                   + f"export struct LightSampler : ILightSampler = {self._light_sampler.slang_type_name};\n")
         has_openpbr = "OpenPBRMaterial" in type_ids
 
         def query(name, backward=False):
             constants = {"has_openpbr": has_openpbr, "normal_maps": self._normal_maps, "backward": backward}
-            function = getattr(module, name).constants(constants).type_conformances(conformances)
+            function = getattr(module, name).constants(constants).prelude(prelude).type_conformances(conformances)
             return function.write(self._helper.bind_scene)
 
         self._query = query
