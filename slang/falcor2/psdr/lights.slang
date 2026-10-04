@@ -58,9 +58,11 @@ float3 env_map_radiance(float theta, no_diff float3 dir)
     // Rotating the map by a small rotation vector r turns the direction into the map by -r.
     float3 d = dir - cross(param3(theta, float3(0), slot + 3), dir);
     float2 uv = world_to_latlong_map(mul(transpose(light.world_from_object), d));
-    // The radiance is proportional to the intensity property.
+    // The radiance is proportional to the intensity property. (Times a detached reciprocal: the quotient rule
+    // divides by the squared denominator, 0 / 0 for a zero intensity, and a NaN drops the whole forward sample.)
     no_diff float3 intensity = no_diff light_value[env_map_id];
-    float3 scale = param3(theta, intensity, slot) / max(intensity, 1e-20) * light.scale;
+    no_diff float3 inverse = 1.0 / max(intensity, 1e-20);
+    float3 scale = param3(theta, intensity, slot) * inverse * light.scale;
     return texel_bilinear(theta, light.env_map_texture_handle, uv, float4(0.0)).rgb * scale;
 }
 
@@ -98,7 +100,8 @@ float3 light_radiance(float theta, Vertex cur, no_diff LightRecord l, out float3
     if (l.slot != NO_SLOT) {
         // Li is proportional to the light's emission property.
         no_diff float3 value = no_diff light_value[(l.slot - light_slot_base) / LIGHT_SLOTS];
-        scale = param3(theta, value, l.slot) / max(value, 1e-20);
+        no_diff float3 inverse = 1.0 / max(value, 1e-20);
+        scale = param3(theta, value, l.slot) * inverse;
     }
     return l.weight * scale * ratio(falloff, detach(falloff)) * l.mis;
 }
