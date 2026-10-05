@@ -151,8 +151,30 @@ class PSDR:
         """Refresh the scene-dependent state after ``scene.update()``: light values and, with geometry, the
         edge lists (needed after vertex or transform changes)."""
         if geometry:
+            self._refresh_layout()
             self._build_edges()
         self._upload_scene_state()
+
+    def _refresh_layout(self):
+        """falcor2 moves a mesh in the global vertex buffer when its vertices are rewritten: re-read the instances'
+        vertex ranges and, if they changed, resize the vertex buffers and drop the cached edge topology (global
+        vertex ids). Otherwise gradients of moved meshes would go to stale ranges or past the buffer's end."""
+        gids = list(self.instances)
+        if not gids:
+            return
+        fn = self._query("instance_info").return_type(spy.Tensor)
+        rows = fn(spy.Tensor.from_numpy(self.device, np.asarray(gids, np.uint32))).to_numpy().reshape(len(gids), 4)
+        info = {gid: np.asarray(row, dtype=np.uint32) for gid, row in zip(gids, rows)}
+        if all(np.array_equal(info[gid], self._info[gid]) for gid in gids):
+            return
+        self._info = info
+        self.vertex_count = int(max(int(i[0] + i[1]) for i in info.values()))
+        n = max(1, self.vertex_count)
+        if self._buffers["vertex_grad"].size < n * 12:
+            self._buffers["vertex_tangent"] = self._buffer(np.zeros((n, 3), np.float32))
+            self._buffers["vertex_grad"] = self._buffer(np.zeros(n * 3, np.float32))
+        self._topology = {}
+        self._vertex_query = None
 
     def set_camera(self, camera: f2.Camera):
         """Render from another camera with the same resolution, e.g. for multi-view optimization."""
