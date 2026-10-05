@@ -304,6 +304,9 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
             derivative = fwd_diff(env_map_radiance)(diffPair(0.0, 1.0), rec.miss_dir).d;
         }
     }
+    // Bound this sample's vertex gradients relative to its contribution (see max_relative_vertex_derivative).
+    vertex_derivative_limit = backward && max_relative_vertex_derivative > 0
+        ? max(max_relative_vertex_derivative * length(weight * value), 1e-30) : 0.0;
     float3 prefix = 1;
     for (uint k = 0; k < rec.length; k++) {
         if (backward) {
@@ -319,5 +322,6 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
         }
         prefix *= rec.terms[k].step;
     }
+    vertex_derivative_limit = 0.0;
     return value;
 }

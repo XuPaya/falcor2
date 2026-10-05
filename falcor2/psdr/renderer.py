@@ -17,6 +17,9 @@ from falcor2.psdr.layout import (ENV_MAP_PARAMS, ENVIRONMENT_LIGHTS, LIGHT_PARAM
                                  light_emission)
 from falcor2.psdr.openpbr import generate_openpbr_headers
 
+# Default vertex_grad_clamp (see PSDR.__init__); 0 disables the clamp.
+VERTEX_GRAD_CLAMP = 0.0
+
 
 class PSDR:
     """Renders a falcor2 scene from a camera: the primal image, forward-mode derivative images and backward-mode
@@ -25,6 +28,11 @@ class PSDR:
     ``light_sampler`` chooses the lights of next-event estimation (default: f2.PowerLightSampler, as the reference
     path tracer). Its emitted-power weights starve small lights next to a distant, physically large one (a sun
     disk); f2.UniformLightSampler samples every light alike.
+
+    ``vertex_grad_clamp`` (default VERTEX_GRAD_CLAMP; 0: off): backward mode bounds each path sample's interior-term
+    vertex gradient to vertex_grad_clamp / scene extent x its dL/dI-weighted contribution. Sharp glossy lobes make
+    the material-form vertex derivative heavy-tailed (rare samples 10^3-10^4 x the mean); the clamp trades a small
+    bias for bounded variance. Forward-mode derivative images are not clamped.
     """
 
     def __init__(
@@ -35,6 +43,7 @@ class PSDR:
         max_bounces: int = 2,
         ray_epsilon: Optional[float] = None,
         photon_radius: Optional[float] = None,
+        vertex_grad_clamp: Optional[float] = None,
         check_visibility: bool = False,
         light_sampler: Optional[f2.LightSampler] = None,
     ):
@@ -117,6 +126,9 @@ class PSDR:
         if photon_radius is None:
             photon_radius = 1.25e-3 * self._scene_extent
         self.photon_radius = photon_radius
+        if vertex_grad_clamp is None:
+            vertex_grad_clamp = VERTEX_GRAD_CLAMP
+        self.vertex_grad_clamp = vertex_grad_clamp
 
         buffer = self._buffer
         self._buffers = {
@@ -140,6 +152,7 @@ class PSDR:
             "texel_slot_count": len(texel_slots),
             "env_map_id": env_map_id,
             "photon_radius": float(photon_radius),
+            "max_relative_vertex_derivative": float(vertex_grad_clamp) / self._scene_extent,
             "check_visibility": check_visibility,
         }
         # Kernels by (name, backward), compiled on first use.

@@ -20,6 +20,14 @@ static const float PHOTON_EMISSIONS = 8192;
 public Camera camera;
 public uint max_bounces;
 public float ray_epsilon;
+/// Backward mode: each path sample's interior-term vertex gradient (per world_vertex call) is clamped to
+/// max_relative_vertex_derivative x |dL/dI x path value| (per unit length; 0: off). Sharp glossy lobes (mirror-
+/// like coats, low roughness) make the material-form vertex derivative heavy-tailed (single samples 10^3-10^4 x
+/// the mean); clamping these rare samples trades a small bias for bounded variance.
+public float max_relative_vertex_derivative;
+/// Thread-local bound of the current path sample's vertex gradients (set by differentiate_path; 0: none, e.g.
+/// in the boundary kernels).
+static float vertex_derivative_limit = 0.0;
 /// Link-time constant selecting backward or forward mode, so each kernel contains one of them.
 public extern static const bool backward;
 public uint seed;

@@ -23,11 +23,14 @@ DifferentialPair<float3> fwd_world_vertex(DifferentialPair<float> theta, Geometr
 
 void bwd_world_vertex(inout DifferentialPair<float> theta, GeometryInstanceID gid, uint v, float3 d)
 {
+    theta = diffPair(theta.p, 0.0);
     float3 g = mul(float4(d, 0), g_scene.get_world_from_object(gid)).xyz;
+    float n = length(g);
+    if (vertex_derivative_limit > 0 && n > vertex_derivative_limit)
+        g *= vertex_derivative_limit / n;
     [ForceUnroll]
     for (uint i = 0; i < 3; i++)
         atomic_add(vertex_grad, 12 * v + 4 * i, g[i]);
-    theta = diffPair(theta.p, 0.0);
 }
 
 struct HitRef
