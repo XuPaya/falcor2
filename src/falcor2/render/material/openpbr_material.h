@@ -138,12 +138,9 @@ private:
         AttributeInfo{"base_color", "base_color", "Color", GROUP_BASE, AttributeType::float3, AttributeKind::color, AttributeFlags::none, float3(0.8f)},
         AttributeInfo{"base_diffuse_roughness", "base_diffuse_roughness", "Diffuse Roughness", GROUP_BASE, AttributeType::float_, AttributeKind::weight, AttributeFlags::none, 0.f},
         AttributeInfo{"base_metalness", "base_metalness", "Metalness", GROUP_BASE, AttributeType::float_, AttributeKind::weight, AttributeFlags::none, 0.f},
-        // Subsurface (TODO)
-        // float subsurface_weight;
-        // vec3 subsurface_color;
+        // Subsurface: weight, color and scatter anisotropy are appended at the end; the volume radius is TODO
         // float subsurface_radius;
         // vec3 subsurface_radius_scale;
-        // float subsurface_scatter_anisotropy;
         // Specular
         AttributeInfo{"specular_weight", "specular_weight", "Weight", GROUP_SPECULAR, AttributeType::float_, AttributeKind::weight, AttributeFlags::none, 1.f},
         AttributeInfo{"specular_color", "specular_color", "Color", GROUP_SPECULAR, AttributeType::float3, AttributeKind::color, AttributeFlags::none, float3(1.f)},
@@ -178,6 +175,10 @@ private:
         // Emission
         AttributeInfo{"emission_luminance", "emission_luminance", "Luminance", GROUP_EMISSION, AttributeType::float_, AttributeKind::positive, AttributeFlags::none, 0.f},
         AttributeInfo{"emission_color", "emission_color", "Color", GROUP_EMISSION, AttributeType::float3, AttributeKind::color, AttributeFlags::none, float3(1.f)},
+        // Subsurface (thin-walled: diffuse transmission)
+        AttributeInfo{"subsurface_weight", "subsurface_weight", "Weight", GROUP_SUBSURFACE, AttributeType::float_, AttributeKind::weight, AttributeFlags::none, 0.f},
+        AttributeInfo{"subsurface_color", "subsurface_color", "Color", GROUP_SUBSURFACE, AttributeType::float3, AttributeKind::color, AttributeFlags::none, float3(0.8f)},
+        AttributeInfo{"subsurface_scatter_anisotropy", "subsurface_scatter_anisotropy", "Scatter Anisotropy", GROUP_SUBSURFACE, AttributeType::float_, AttributeKind::signed_unit, AttributeFlags::none, 0.f},
         // clang-format on
     };
 

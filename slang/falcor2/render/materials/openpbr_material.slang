@@ -319,6 +319,10 @@ public struct OpenPBRMaterial : IMaterial
         // Emission
         FloatAttribute emission_luminance;
         Float3Attribute emission_color;
+        // Subsurface
+        FloatAttribute subsurface_weight;
+        Float3Attribute subsurface_color;
+        FloatAttribute subsurface_scatter_anisotropy;
     };
 
     public MaterialHeader header;
@@ -409,6 +413,12 @@ public struct OpenPBRMaterial : IMaterial
         // Emission
         mi.inputs.emission_luminance = eval_attribute(attributes.emission_luminance, si.uv, lod_sampler);
         mi.inputs.emission_color = eval_attribute(attributes.emission_color, si.uv, lod_sampler);
+
+        // Subsurface
+        mi.inputs.subsurface_weight = eval_attribute(attributes.subsurface_weight, si.uv, lod_sampler);
+        mi.inputs.subsurface_color = eval_attribute(attributes.subsurface_color, si.uv, lod_sampler);
+        mi.inputs.subsurface_scatter_anisotropy
+            = eval_attribute(attributes.subsurface_scatter_anisotropy, si.uv, lod_sampler);
 
         // Geometry
         // inputs.geometry_opacity = 1.0f;

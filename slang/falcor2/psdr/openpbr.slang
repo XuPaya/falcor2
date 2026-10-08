@@ -712,6 +712,9 @@ struct PbrAttributes
     PbrFloat thin_film_ior;
     PbrFloat emission_luminance;
     PbrFloat3 emission_color;
+    PbrFloat subsurface_weight;
+    PbrFloat3 subsurface_color;
+    PbrFloat subsurface_scatter_anisotropy;
 };
 
 [Differentiable]
@@ -730,11 +733,11 @@ float3 attribute(float theta, no_diff PbrFloat3 a, no_diff float2 uv, no_diff ui
 }
 
 /// Texture index and size of OpenPBR texture `role`: the attributes in declaration order (0-29), the normal
-/// map (30). The dispersion attributes (23, 24) have none.
+/// map (30), subsurface weight, color and scatter anisotropy (31-33). The dispersion attributes (23, 24) have none.
 uint3 openpbr_texture(OpenPBRMaterial m, uint role)
 {
     PbrAttributes a = m.attributes_buffer.load<PbrAttributes>(0);
-    uint textures[31] = {
+    uint textures[34] = {
         a.base_weight.texture_handle.data, a.base_color.texture_handle.data,
         a.base_diffuse_roughness.texture_handle.data, a.base_metalness.texture_handle.data,
         a.specular_weight.texture_handle.data, a.specular_color.texture_handle.data,
@@ -748,7 +751,9 @@ uint3 openpbr_texture(OpenPBRMaterial m, uint role)
         a.transmission_scatter_anisotropy.texture_handle.data, 0xffffffff, 0xffffffff,
         a.thin_film_weight.texture_handle.data, a.thin_film_thickness.texture_handle.data,
         a.thin_film_ior.texture_handle.data, a.emission_luminance.texture_handle.data,
-        a.emission_color.texture_handle.data, m.normal_texture_handle.data
+        a.emission_color.texture_handle.data, m.normal_texture_handle.data,
+        a.subsurface_weight.texture_handle.data, a.subsurface_color.texture_handle.data,
+        a.subsurface_scatter_anisotropy.texture_handle.data
     };
     return texture_info(textures[role], false);
 }
@@ -792,6 +797,9 @@ OpenPBR_ResolvedInputs openpbr_inputs(float theta, no_diff Surface s)
     i.thin_film_ior = attribute(theta, a.thin_film_ior, uv, k + 39);
     i.emission_luminance = attribute(theta, a.emission_luminance, uv, k + 40);
     i.emission_color = attribute(theta, a.emission_color, uv, k + 41);
+    i.subsurface_weight = attribute(theta, a.subsurface_weight, uv, k + 45);
+    i.subsurface_color = attribute(theta, a.subsurface_color, uv, k + 46);
+    i.subsurface_scatter_anisotropy = attribute(theta, a.subsurface_scatter_anisotropy, uv, k + 49);
     i.geometry_thin_walled = (s.openpbr.header.flags & MaterialFlags::thin_walled) != MaterialFlags::none;
     // The shading frame of OpenPBRMaterial.setup_material_instance().
     float4 sampled = s.openpbr.normal_texture_handle.sample(ExplicitLodSampler(), uv, float4(0.0, 0.0, 1.0, 0.0));

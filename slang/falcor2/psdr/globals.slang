@@ -11,7 +11,7 @@ static const uint NO_SLOT = 0xffffffff;
 /// ior (5), emissive factor (6-8), diffuse transmission (9), specular transmission (10), transmission
 /// color (11-13), normal map scale (14). OpenPBRMaterial: its attributes in declaration order (44 slots, see
 /// openpbr.slang) and the normal map scale (44). Other materials are evaluated without derivatives.
-static const uint MATERIAL_SLOTS = 48;
+static const uint MATERIAL_SLOTS = 52;
 /// Parameter slots per light, in LightID order: emission (intensity or radiance, 0-2) and translation (3-5)
 /// of analytic lights; intensity (0-2) and rotation (a world-space rotation vector, 3-5) of environment maps.
 static const uint LIGHT_SLOTS = 6;

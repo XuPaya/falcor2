@@ -8,7 +8,7 @@ import numpy as np
 import falcor2 as f2
 
 MAX_DEPTH = 8
-MATERIAL_SLOTS = 48
+MATERIAL_SLOTS = 52
 LIGHT_SLOTS = 6
 PHOTON_EMISSIONS = 8192
 NO_SLOT = 0xFFFFFFFF
@@ -37,12 +37,13 @@ MATERIAL_PARAMS = {
     # Attributes in declaration order, three slots for colors (see slang/falcor2/psdr/openpbr.slang).
     "OpenPBRMaterial": dict(zip(_OPENPBR_ATTRIBUTES, np.cumsum(
         [0] + [3 if name in _OPENPBR_COLORS else 1 for name in _OPENPBR_ATTRIBUTES[:-1]]).tolist()))
-    | {"normal_texture_scale": 44},
+    | {"normal_texture_scale": 44, "subsurface_weight": 45, "subsurface_color": 46, "subsurface_scatter_anisotropy": 49},
 }
 # Textures with texel parameters (see material_texture() in slang/falcor2/psdr/queries.slang).
 MATERIAL_TEXTURES = {
     "StandardMaterial": ("base_color", "metallic_roughness", "emissive", "normal", "transmission"),
-    "OpenPBRMaterial": tuple(_OPENPBR_ATTRIBUTES) + ("normal",),
+    "OpenPBRMaterial": tuple(_OPENPBR_ATTRIBUTES) + ("normal", "subsurface_weight", "subsurface_color",
+                                                     "subsurface_scatter_anisotropy"),
 }
 # Analytic lights: emission and world-space translation. Environment map: intensity and rotation (a rotation
 # vector in world space, applied before the map's orientation).
