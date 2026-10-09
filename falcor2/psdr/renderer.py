@@ -29,6 +29,11 @@ class PSDR:
     path tracer). Its emitted-power weights starve small lights next to a distant, physically large one (a sun
     disk); f2.UniformLightSampler samples every light alike.
 
+    ``photon_count`` (default PHOTON_EMISSIONS): edge photons per pass of the secondary-edge term, spread over
+    ``photon_edge_count`` edges of total length ``photon_edge_length`` (boundary and convex sharp edges of every
+    mesh) in proportion to length. More photons per pass cut its variance; e.g. one per edge, or about one per
+    photon_radius of edge length.
+
     ``vertex_grad_clamp`` (default VERTEX_GRAD_CLAMP; 0: off): backward mode bounds each path sample's interior-term
     vertex gradient to vertex_grad_clamp / scene extent x its dL/dI-weighted contribution. Sharp glossy lobes make
     the material-form vertex derivative heavy-tailed (rare samples 10^3-10^4 x the mean); the clamp trades a small
@@ -46,6 +51,7 @@ class PSDR:
         vertex_grad_clamp: Optional[float] = None,
         check_visibility: bool = False,
         light_sampler: Optional[f2.LightSampler] = None,
+        photon_count: int = PHOTON_EMISSIONS,
     ):
         if not 0 <= max_bounces <= MAX_DEPTH:
             raise ValueError(f"max_bounces must be in [0, {MAX_DEPTH}]")
@@ -137,8 +143,6 @@ class PSDR:
             "vertex_grad": buffer(np.zeros(max(1, self.vertex_count) * 3, np.float32)),
             "param_grad": buffer(np.zeros(max(1, self.param_count), np.float32)),
             "dl_di": buffer(np.zeros((self.width * self.height, 3), np.float32)),
-            "photons": buffer(np.zeros(PHOTON_EMISSIONS * 12, np.float32), struct_size=48),
-            "photon_bounds": buffer(np.zeros((2 * PHOTON_EMISSIONS, 3), np.float32)),
             "texel_slots": buffer(texel_slots),
         }
         for name in ("primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary"):
@@ -157,8 +161,32 @@ class PSDR:
         }
         # Kernels by (name, backward), compiled on first use.
         self._kernels = {}
-        self._photon_accel = None
+        self.photon_count = photon_count
         self._upload_scene_state()
+
+    @property
+    def photon_count(self) -> int:
+        return self._globals["photon_count"]
+
+    @photon_count.setter
+    def photon_count(self, count: int):
+        count = int(count)
+        if count < 1:
+            raise ValueError("photon_count must be positive")
+        self._globals["photon_count"] = count
+        self._buffers["photons"] = self._buffer(np.zeros(count * 12, np.float32), struct_size=48)
+        self._buffers["photon_bounds"] = self._buffer(np.zeros((2 * count, 3), np.float32))
+        self._photon_accel = None
+
+    @property
+    def photon_edge_count(self) -> int:
+        """Number of edges the secondary-edge photons are sampled on."""
+        return len(self._photon)
+
+    @property
+    def photon_edge_length(self) -> float:
+        """Total length of the edges the secondary-edge photons are sampled on."""
+        return self._photon_length
 
     def update(self, geometry: bool = True):
         """Refresh the scene-dependent state after ``scene.update()``: light values and, with geometry, the
@@ -294,7 +322,7 @@ class PSDR:
                            tid=spy.grid((count,)), samples=samples)
         if "secondary" in terms and len(self._photon):
             for i in range(spp):
-                self._call("sample_photons", False, seed * spp + i, tid=spy.grid((PHOTON_EMISSIONS,)))
+                self._call("sample_photons", False, seed * spp + i, tid=spy.grid((self.photon_count,)))
                 self._build_photon_bvh()
                 self._call("render_secondary", backward, seed, pixel=pixels, spp_index=i, spp=spp)
 
@@ -340,7 +368,7 @@ class PSDR:
             builds = []
             inputs = [spy.AccelerationStructureBuildInputProceduralPrimitives({
                 "aabb_buffers": [self._buffers["photon_bounds"]], "aabb_stride": 24,
-                "primitive_count": PHOTON_EMISSIONS})]
+                "primitive_count": self.photon_count})]
             for kind in (spy.AccelerationStructureKind.bottom_level, spy.AccelerationStructureKind.top_level):
                 desc = spy.AccelerationStructureBuildDesc(
                     {"inputs": inputs, "flags": spy.AccelerationStructureBuildFlags.prefer_fast_build})

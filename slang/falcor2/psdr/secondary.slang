@@ -243,7 +243,7 @@ float3 segment_gradient(HitRef receiver_hit, SegmentSource source, float3 weight
     float3 dir = source.infinite ? source.normal : normalize(s.p - d.p);
     Neighbors knn = gather(d.p, dir, source.infinite ? 1e30 : length(s.p - d.p));
     float r = knn.count == 16 ? knn.max_dist : photon_radius;
-    float density = 1.0 / (r * r * float.PI * PHOTON_EMISSIONS);
+    float density = 1.0 / (r * r * float.PI * photon_count);
     float3 result = 0;
     for (uint k = 0; k < knn.count; k++) {
         Photon photon = photons[knn.index[k]];

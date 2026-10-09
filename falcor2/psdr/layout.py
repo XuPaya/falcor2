@@ -10,7 +10,7 @@ import falcor2 as f2
 MAX_DEPTH = 8
 MATERIAL_SLOTS = 52
 LIGHT_SLOTS = 6
-PHOTON_EMISSIONS = 8192
+PHOTON_EMISSIONS = 8192  # default PSDR photon_count
 NO_SLOT = 0xFFFFFFFF
 _OPENPBR_ATTRIBUTES = (
     "base_weight base_color base_diffuse_roughness base_metalness specular_weight specular_color specular_roughness "

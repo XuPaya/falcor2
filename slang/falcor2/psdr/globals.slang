@@ -15,7 +15,6 @@ static const uint MATERIAL_SLOTS = 52;
 /// Parameter slots per light, in LightID order: emission (intensity or radiance, 0-2) and translation (3-5)
 /// of analytic lights; intensity (0-2) and rotation (a world-space rotation vector, 3-5) of environment maps.
 static const uint LIGHT_SLOTS = 6;
-static const float PHOTON_EMISSIONS = 8192;
 
 public Camera camera;
 public uint max_bounces;
@@ -25,6 +24,8 @@ public float ray_epsilon;
 /// like coats, low roughness) make the material-form vertex derivative heavy-tailed (single samples 10^3-10^4 x
 /// the mean); clamping these rare samples trades a small bias for bounded variance.
 public float max_relative_vertex_derivative;
+/// Photons per secondary-edge photon pass (PSDR.photon_count).
+public uint photon_count;
 /// Thread-local bound of the current path sample's vertex gradients (set by differentiate_path; 0: none, e.g.
 /// in the boundary kernels).
 static float vertex_derivative_limit = 0.0;
