@@ -31,6 +31,12 @@ extern static const bool ENABLE_DEPTH_OF_FIELD = true;
 extern static const SchedulingMode SCHEDULING_MODE = SchedulingMode::simple;
 /// Visibility traversal implementation.
 extern static const VisibilityRayMode VISIBILITY_RAY_MODE = VisibilityRayMode::ray_query;
+/// Combine with the adjoint light tracer (adjoint_pathtracer.slang) by multiple importance sampling: the
+/// emission (s = 0), next-event (s = 1) and light-tracing (t = 1) strategies of bidirectional path tracing (Veach
+/// 1997, ch. 10), balance heuristic. The camera path carries the partial ratio of the light-tracing density to its
+/// own (light_tracer_ratio, the light-tracing counterpart of dVC in Georgiev 2012, "Implementing Vertex Connection
+/// and Merging").
+extern static const bool ENABLE_LIGHT_TRACER_MIS = false;
 
 public extern struct LightSampler : ILightSampler = PowerLightSampler;
 
@@ -38,6 +44,9 @@ static const bool HANDLE_HOMOGENEOUS_MEDIA = ENABLE_INTERIOR_TRACKING && ENABLE_
 static const float RUSSIAN_ROULETTE_MAX_SURVIVAL = 0.95;
 
 public ParameterBlock<LightSampler> light_sampler;
+
+/// The bound light sampler as a value (for the generic emission functions of render/light_emission.slang).
+LightSampler scene_light_sampler() { return light_sampler; }
 
 public enum class SchedulingMode : uint {
     simple = 0,
@@ -93,6 +102,9 @@ enum class PathFlags {
     primary_specular_reflection = (1 << 4),
     /// Current ray ends at a finite sampled homogeneous-medium event.
     volume_event = (1 << 5),
+    /// The light tracer cannot generate the path (scattering medium event, delta lobe at the primary hit, depth of
+    /// field): its density is zero.
+    light_tracer_unreachable = (1 << 6),
 };
 
 struct PathState : IDifferentiable
@@ -113,10 +125,25 @@ struct PathState : IDifferentiable
     float3 ray_origin_ws = {};
     float3 ray_dir_ws = {};
 
-    float3 scatter_normal_ws = {};
+    /// Normal of the last scattering surface (scatter_normal_ws), octahedral in two floats (exact to float precision;
+    /// SCATTER_NORMAL_NONE: none). With light_tracer_ratio it takes the size of a float3: the path state is the ray
+    /// payload, and a larger payload crashed alpha-tested (any-hit) pipelines on D3D12.
+    float2 scatter_normal_oct = SCATTER_NORMAL_NONE;
+    /// ENABLE_LIGHT_TRACER_MIS: N p_t1 / p_camera of the path prefix: light paths per frame x the product of the
+    /// light tracer's (reverse) and this path's (forward) sampling densities in area measure, up to the current
+    /// vertex, without the light tracer's density of sampling the direction towards the previous vertex here.
+    no_diff float light_tracer_ratio = {};
     float scatter_pdf = {};
     float3 throughput = float3(1.0);
     float3 radiance = {};
+
+    static const float2 SCATTER_NORMAL_NONE = float2(2.0);
+
+    property float3 scatter_normal_ws
+    {
+        get { return scatter_normal_oct.x > 1.5 ? float3(0.0) : oct_to_ndir_snorm(scatter_normal_oct); }
+        set { scatter_normal_oct = any(newValue != 0.0) ? ndir_to_oct_snorm(newValue) : SCATTER_NORMAL_NONE; }
+    }
 
     __init(UniformSampleGenerator sg, uint path_id, Ray ray)
     {
@@ -189,6 +216,7 @@ struct PathState : IDifferentiable
     bool is_light_sampled() { return has_flag(PathFlags::light_sampled_upper | PathFlags::light_sampled_lower); }
     bool is_primary_specular_reflection() { return has_flag(PathFlags::primary_specular_reflection); }
     bool is_volume_event() { return has_flag(PathFlags::volume_event); }
+    bool is_light_tracer_unreachable() { return has_flag(PathFlags::light_tracer_unreachable); }
 
     [mutating]
     void set_active(bool value = true) { set_flag(PathFlags::active, value); }
@@ -210,6 +238,9 @@ struct PathState : IDifferentiable
 
     [mutating]
     void set_volume_event(bool value = true) { set_flag(PathFlags::volume_event, value); }
+
+    [mutating]
+    void set_light_tracer_unreachable(bool value = true) { set_flag(PathFlags::light_tracer_unreachable, value); }
 
     [mutating]
     void set_light_sampled(bool upper, bool lower)
@@ -534,8 +565,24 @@ extern static const bool WriteGuide_emission = false;
 extern static const bool WriteGuide_geometry_id = false;
 extern static const bool WriteGuide_nan_count = false;
 
+/// The light tracer's density of sampling the direction towards the previous path vertex at the current vertex, given
+/// light arriving from to_light (the reverse density of bidirectional path tracing; its directional part, solid angle).
+/// 1 at the primary hit: the light tracer connects that vertex to the camera.
+float light_tracer_reverse_pdf(no_diff IHitInfo hit, const SurfaceInteraction si, const float3 to_light,
+                               const PathState path)
+{
+    if (path.depth <= 1)
+        return 1.0;
+    SurfaceInteraction light_si = g_scene.make_surface_interaction(hit, to_light);
+    light_si.exterior_ior = si.exterior_ior;
+    let light_mi = g_scene.get_material_instance(hit, light_si, ExplicitLodSampler(0), MaterialInstanceHints::adjust_shading_normal);
+    UniformSampleGenerator eval_sg = UniformSampleGenerator(0);
+    return light_mi.eval_with_pdf(light_si, si.wi_ws, eval_sg).pdf;
+}
+
 void sample_direct_lighting<VisibilityQuery : IVisibilityQuery>(
     VisibilityQuery visibility_query,
+    no_diff IHitInfo hit,
     const SurfaceInteraction si,
     const MaterialID material_id,
     const bool is_thin_walled,
@@ -571,11 +618,62 @@ void sample_direct_lighting<VisibilityQuery : IVisibilityQuery>(
     if (ENABLE_MIS && !sample.nee_only) {
         const BSDFEval scatter = material_instance.eval_with_pdf(si, sample.dir_ws, path.sg);
         scatter_eval = scatter.value;
-        mis_weight = mis_heuristic(1, sample.pdf, 1, scatter.pdf);
+        if (ENABLE_LIGHT_TRACER_MIS) {
+            float ratio = scatter.pdf / sample.pdf + light_tracer_nee_ratio(hit, si, sample, path);
+            mis_weight = 1.0 / (1.0 + ratio);
+        } else {
+            mis_weight = mis_heuristic(1, sample.pdf, 1, scatter.pdf);
+        }
     } else {
         scatter_eval = material_instance.eval(si, sample.dir_ws, path.sg);
+        if (ENABLE_LIGHT_TRACER_MIS)
+            mis_weight = 1.0 / (1.0 + light_tracer_nee_ratio(hit, si, sample, path));
     }
     path.radiance += path.throughput * scatter_eval * sample.weight * mis_weight;
+}
+
+/// p_t1 / p_s1 of a next-event sample: the light tracer's density of the whole path over this path's (prefix
+/// densities x the light sample's density). Zero where the light tracer cannot generate the path.
+float light_tracer_nee_ratio(no_diff IHitInfo hit, const SurfaceInteraction si, const LightSample sample,
+                             const PathState path)
+{
+    if (!ENABLE_LIGHT_TRACER_MIS || path.is_light_tracer_unreachable() || !(path.light_tracer_ratio > 0.0))
+        return 0.0;
+    const LightEmissionSettings emission = g_path_tracer.settings.light_emission;
+    const float cos_here = abs(dot(si.normal_ws, sample.dir_ws));
+    float ratio;
+    if (sample.emitter_type == EmitterType::environment) {
+        // Environment: no distance and no cosine at the light (area measure of the emission disk).
+        const float pe = environment_emission_pdf(scene_light_sampler(), emission, sample.dir_ws);
+        ratio = pe * cos_here / sample.pdf;
+    } else {
+        const EmitterType type = sample.emitter_type;
+        const float pe = emission_pdf(scene_light_sampler(), emission, type, sample.emitter_id, sample.pos_ws, sample.normal_ws,
+                                      -sample.dir_ws);
+        if (!(pe > 0.0))
+            return 0.0;
+        const float d2 = sample.distance * sample.distance;
+        const bool point = type == EmitterType::analytic && all(sample.normal_ws == 0.0);
+        // The next-event density in area measure at the light (point lights: the selection probability).
+        const float light_area_pdf = point ? sample.pdf : sample.pdf * abs(dot(sample.normal_ws, sample.dir_ws)) / d2;
+        if (!(light_area_pdf > 0.0))
+            return 0.0;
+        ratio = pe * cos_here / d2 / light_area_pdf;
+    }
+    return path.light_tracer_ratio * light_tracer_reverse_pdf(hit, si, sample.dir_ws, path) * ratio;
+}
+
+/// p_t1 / p_s0 of an emissive triangle found by a scattered ray (path.light_tracer_ratio is already divided by the
+/// arrival cosine at the emitter).
+float light_tracer_emitter_ratio(no_diff IHitInfo hit, const SurfaceInteraction si, const PathState path)
+{
+    if (!ENABLE_LIGHT_TRACER_MIS || path.is_light_tracer_unreachable())
+        return 0.0;
+    const EmissiveTriangleID triangle_id
+        = g_scene.emissive_geometry.get_triangle_id(hit.geometry_instance_id, hit.primitive_index);
+    const float pe = emission_pdf(scene_light_sampler(), g_path_tracer.settings.light_emission, EmitterType::emissive_triangle,
+                                  uint(triangle_id), si.position_ws, si.normal_ws, -path.ray_dir_ws);
+    return path.light_tracer_ratio * pe;
 }
 
 bool generate_scatter_ray(const SurfaceInteraction si, const MaterialSample sample, inout PathState path)
@@ -602,6 +700,10 @@ public struct PathTracerSettings
     bool use_background_color = false;
     /// Constant color used for the primary-ray background.
     float3 background_color = float3(0.0, 0.0, 0.0);
+    /// ENABLE_LIGHT_TRACER_MIS: light paths per frame over camera paths per pixel and frame (the light tracer's
+    /// sample count relative to this tracer's), and its emission settings.
+    float light_tracer_path_count = 0.0;
+    LightEmissionSettings light_emission = {};
 };
 
 bool should_skip_nested_interface(const PathState path, const MaterialHeader material_header)
@@ -642,6 +744,7 @@ public struct PathTracer
         path.set_volume_event(false);
         path.set_light_sampled(false, false);
         path.set_delta(false);
+        path.set_light_tracer_unreachable();
         path.set_primary_specular_reflection(false);
         path.scatter_normal_ws = {};
         path.advance_depth();
@@ -695,6 +798,14 @@ public struct PathTracer
             if (handle_environment_light && apply_environment_mis) {
                 float light_pdf = light_sampler.eval_environment_pdf(light_ctx, path.ray_dir_ws);
                 mis_weight = mis_heuristic(1, path.scatter_pdf, 1, light_pdf);
+            }
+            if (ENABLE_LIGHT_TRACER_MIS && handle_environment_light) {
+                float ratio = apply_environment_mis && !path.is_delta()
+                    ? light_sampler.eval_environment_pdf(light_ctx, path.ray_dir_ws) / path.scatter_pdf : 0.0;
+                if (!path.is_light_tracer_unreachable())
+                    ratio += path.light_tracer_ratio
+                        * environment_emission_pdf(scene_light_sampler(), settings.light_emission, path.ray_dir_ws);
+                mis_weight = 1.0 / (1.0 + ratio);
             }
             let eval = g_scene.light_system.eval_environment_radiance(light_ctx, path.ray_dir_ws);
             path.radiance += path.throughput * eval * mis_weight;
@@ -771,6 +882,27 @@ public struct PathTracer
         path.advance_depth();
         bool is_primary_hit = path.depth == 1;
 
+        if (ENABLE_LIGHT_TRACER_MIS) {
+            // Area measure at this vertex: the camera's density of the primary hit, or the cosine of the arrival.
+            const float cos_in = abs(dot(si.normal_ws, path.ray_dir_ws));
+            if (is_primary_hit) {
+                const Camera camera = context.current_camera;
+                const float3 d = si.position_ws - camera.position;
+                const float dist2 = dot(d, d);
+                const float w2 = dot(camera.image_w, camera.image_w);
+                const float c = dot(normalize(d), camera.image_w) * rsqrt(w2);
+                const float pixel_area = 4.0 * length(camera.image_u) * length(camera.image_v)
+                    / float(camera.dims.x * camera.dims.y);
+                const float camera_area_pdf = w2 / (pixel_area * c * c * c * dist2) * cos_in;
+                path.light_tracer_ratio = camera_area_pdf > 0.0
+                    ? settings.light_tracer_path_count / camera_area_pdf : 0.0;
+                if (ENABLE_DEPTH_OF_FIELD && camera.aperture_radius > 0.0 && camera.focus_distance > 0.0)
+                    path.set_light_tracer_unreachable();
+            } else {
+                path.light_tracer_ratio = cos_in > 0.0 ? path.light_tracer_ratio / cos_in : 0.0;
+            }
+        }
+
         if (is_primary_hit)
             write_primary_surface_interaction(id, hit, si, context.current_camera, context.previous_camera);
 
@@ -804,6 +936,10 @@ public struct PathTracer
                     = g_scene.emissive_geometry.get_triangle_id(hit.geometry_instance_id, hit.primitive_index);
                 float light_pdf = light_sampler.eval_emissive_pdf(light_ctx, triangle_id, si.position_ws, si.normal_ws);
                 mis_weight = mis_heuristic(1, path.scatter_pdf, 1, light_pdf);
+                if (ENABLE_LIGHT_TRACER_MIS)
+                    mis_weight = 1.0 / (1.0 + light_pdf / path.scatter_pdf + light_tracer_emitter_ratio(hit, si, path));
+            } else if (ENABLE_LIGHT_TRACER_MIS && !is_primary_hit) {
+                mis_weight = 1.0 / (1.0 + light_tracer_emitter_ratio(hit, si, path));
             }
             path.radiance += path.throughput * material_instance.eval_emissive_radiance() * mis_weight;
         }
@@ -814,7 +950,7 @@ public struct PathTracer
         }
 
         // Add NEE (next event estimation) contribution.
-        sample_direct_lighting(visibility_query, si, material_id, is_thin_walled, material_instance, path);
+        sample_direct_lighting(visibility_query, hit, si, material_id, is_thin_walled, material_instance, path);
 
         // Sample BRDF to generate next path segment.
         MaterialSample sample = {};
@@ -836,6 +972,19 @@ public struct PathTracer
             if (result != InteriorListUpdateResult::success) {
                 path.terminate();
                 return;
+            }
+        }
+
+        if (ENABLE_LIGHT_TRACER_MIS) {
+            // Light-tracing ratio of the next vertex (divided by its arrival cosine there): the light tracer's
+            // reverse density here over this sample's density, and the cosine of departure.
+            const float cos_out = abs(dot(si.normal_ws, sample.wo_ws));
+            if (sample.has_flag(BSDFFlags::delta)) {
+                path.light_tracer_ratio *= cos_out;
+                if (is_primary_hit)
+                    path.set_light_tracer_unreachable();     // the light tracer cannot connect a delta vertex
+            } else {
+                path.light_tracer_ratio *= light_tracer_reverse_pdf(hit, si, sample.wo_ws, path) * cos_out / sample.pdf;
             }
         }
 

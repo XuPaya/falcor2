@@ -6,6 +6,8 @@
 #include "falcor2/core/error.h"
 #include "falcor2/render/scene.h"
 #include "falcor2/render/component/light.h"
+#include "falcor2/render/entity.h"
+#include "falcor2/utils/aabb.h"
 
 #include <sgl/device/device.h>
 #include <sgl/device/command.h>
@@ -141,6 +143,20 @@ SceneUpdateFlags LightSystem::update(SceneUpdateContext& ctx)
             });
         }
 
+        // Bounding sphere of the scene's geometry: finite lights far outside it are selected by the flux they deliver
+        // into it (as pbrt's DistantLight::Phi), not by their total emitted flux.
+        AABB bounds;
+        auto& entities = m_scene->entities();
+        for (size_t i = 0; i < entities.size(); ++i) {
+            AABB b = entities[i]->world_aabb();
+            if (b.is_valid()) {
+                bounds.expand(b.min);
+                bounds.expand(b.max);
+            }
+        }
+        const float3 scene_center = bounds.is_valid() ? (bounds.min + bounds.max) * 0.5f : float3(0.f);
+        const float scene_radius = bounds.is_valid() ? 0.5f * length(bounds.max - bounds.min) : 0.f;
+
         m_compute_light_powers_kernel->dispatch(
             uint3(m_light_count, 1, 1),
             [&](sgl::ShaderCursor cursor)
@@ -150,6 +166,10 @@ SceneUpdateFlags LightSystem::update(SceneUpdateContext& ctx)
                 light_system["light_data"] = m_light_data.buffer();
                 cursor["powers"] = m_light_power_buffer;
                 cursor["light_count"] = m_light_count;
+                if (cursor.has_field("scene_radius")) {
+                    cursor["scene_center"] = scene_center;
+                    cursor["scene_radius"] = scene_radius;
+                }
             },
             ctx.command_encoder()
         );

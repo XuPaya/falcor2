@@ -74,6 +74,14 @@ class ReferencePathTracerNode(RenderNode):
         self._enable_depth_of_field = True
         self._use_background_color = False
         self._background_color = float3(0.0, 0.0, 0.0)
+        self._enable_light_tracer_mis = False
+        self._light_tracer_path_count = 0.0
+        self._light_emission: dict[str, Any] = {
+            "target_center": float3(0.0),
+            "target_radius": 1.0,
+            "scene_center": float3(0.0),
+            "scene_radius": 1.0,
+        }
         self._scheduling_mode = SchedulingMode.simple
         self._visibility_ray_mode = (
             VisibilityRayMode.ray_query
@@ -113,6 +121,7 @@ class ReferencePathTracerNode(RenderNode):
             "ENABLE_DEPTH_OF_FIELD": self._enable_depth_of_field,
             "SCHEDULING_MODE": int(self._scheduling_mode),
             "VISIBILITY_RAY_MODE": int(self._visibility_ray_mode),
+            "ENABLE_LIGHT_TRACER_MIS": self._enable_light_tracer_mis,
         }
         self._render_func = None
         self._render_func_constants = None
@@ -124,6 +133,8 @@ class ReferencePathTracerNode(RenderNode):
             "rr_depth": self._rr_depth,
             "use_background_color": self._use_background_color,
             "background_color": self._background_color,
+            "light_tracer_path_count": self._light_tracer_path_count,
+            "light_emission": dict(self._light_emission),
         }
 
     @property
@@ -312,6 +323,30 @@ class ReferencePathTracerNode(RenderNode):
     def background_color(self, value: float3) -> None:
         """Set the constant background color."""
         self._background_color = value
+        self.settings_changed()
+
+    @property
+    def enable_light_tracer_mis(self) -> bool:
+        """Whether this tracer's emission and next-event estimates are weighted by multiple importance sampling against
+        the adjoint light tracer's (AdjointPathTracerNode sets this; alone it removes the light-traced share)."""
+        return self._enable_light_tracer_mis
+
+    @enable_light_tracer_mis.setter
+    def enable_light_tracer_mis(self, value: bool) -> None:
+        self._enable_light_tracer_mis = bool(value)
+        self.constants_changed()
+
+    def set_light_tracer(self, path_count: float, target_center, target_radius: float, scene_center,
+                         scene_radius: float) -> None:
+        """MIS settings shared with the adjoint light tracer: light paths per frame over camera paths per pixel and
+        frame, and the emission target / scene bounding spheres of its emission sampling."""
+        self._light_tracer_path_count = float(path_count)
+        self._light_emission = {
+            "target_center": float3(*map(float, target_center)),
+            "target_radius": float(target_radius),
+            "scene_center": float3(*map(float, scene_center)),
+            "scene_radius": float(scene_radius),
+        }
         self.settings_changed()
 
     @reflected_property(

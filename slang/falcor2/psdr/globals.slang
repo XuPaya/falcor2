@@ -10,7 +10,9 @@ static const uint NO_SLOT = 0xffffffff;
 /// Parameter slots per material. StandardMaterial: base color (0-2), metallic (3), roughness (4),
 /// ior (5), emissive factor (6-8), diffuse transmission (9), specular transmission (10), transmission
 /// color (11-13), normal map scale (14). OpenPBRMaterial: its attributes in declaration order (44 slots, see
-/// openpbr.slang) and the normal map scale (44). Other materials are evaluated without derivatives.
+/// openpbr.slang) and the normal map scale (44). SpongeCakeMaterial: albedo (0-2), thickness (3), roughness (4),
+/// top albedo (5-7), top thickness (8), top roughness (9), base color (10-12), base weight (13), normal map scale
+/// (14). Other materials are evaluated without derivatives.
 static const uint MATERIAL_SLOTS = 52;
 /// Parameter slots per light, in LightID order: emission (intensity or radiance, 0-2) and translation (3-5)
 /// of analytic lights; intensity (0-2) and rotation (a world-space rotation vector, 3-5) of environment maps.
@@ -18,6 +20,9 @@ static const uint LIGHT_SLOTS = 6;
 
 public Camera camera;
 public uint max_bounces;
+/// Russian roulette from this path depth on (the reference path tracer's rr_depth; path vertices so far); 0xffffffff:
+/// off.
+public uint rr_depth;
 public float ray_epsilon;
 /// Backward mode: each path sample's interior-term vertex gradient (per world_vertex call) is clamped to
 /// max_relative_vertex_derivative x |dL/dI x path value| (per unit length; 0: off). Sharp glossy lobes (mirror-
@@ -34,9 +39,13 @@ public extern static const bool backward;
 public uint seed;
 public uint standard_type_id;
 public uint openpbr_type_id;
+public uint spongecake_type_id;
 /// Link-time constant: whether the scene has OpenPBR materials. Without them, the differentiable
 /// OpenPBR evaluation, which is expensive to compile, is compiled out.
 public extern static const bool has_openpbr;
+/// Link-time constant: whether the scene has SpongeCake materials (their differentiable evaluation is compiled in
+/// only then).
+public extern static const bool has_spongecake = false;
 /// Link-time constant: whether materials have normal maps. Without them, shading frames are constant, which
 /// keeps the BSDF derivatives much cheaper.
 public extern static const bool normal_maps;

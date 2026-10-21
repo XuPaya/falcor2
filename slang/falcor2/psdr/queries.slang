@@ -61,5 +61,21 @@ public uint3 material_texture(uint material, uint role, uint standard_id, uint o
     return uint3(NO_SLOT, 0, 0);
 }
 
+/// Texture index, width and height of texture `role` of a SpongeCakeMaterial: albedo, top albedo, base color and
+/// normal textures (roles 0-3).
+public uint3 spongecake_texture(uint material, uint role, uint spongecake_id)
+{
+    MaterialData data = g_scene.material_system.get_material_data(MaterialID(material));
+    if (data.header.type_id != spongecake_id)
+        return uint3(NO_SLOT, 0, 0);
+    SpongeCakeMaterial m = reinterpret<SpongeCakeMaterial>(data);
+    switch (role) {
+    case 0: return texture_info(m.albedo_texture.data, m.albedo_texture.is_udim());
+    case 1: return texture_info(m.top_albedo_texture.data, m.top_albedo_texture.is_udim());
+    case 2: return texture_info(m.base_color_texture.data, m.base_color_texture.is_udim());
+    default: return texture_info(m.normal_texture.data, m.normal_texture.is_udim());
+    }
+}
+
 /// Texture index, width and height of an environment map light's texture.
 public uint3 env_map_texture(uint id) { return texture_info(env_map_light(id).env_map_texture_handle); }

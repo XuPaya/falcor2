@@ -23,6 +23,24 @@ public interface ILightSampler
         const float3 emitter_pos_ws,
         const float3 emitter_normal_ws
     );
+
+    /// Evaluates the complete next-event PDF (solid angle at ctx.pos_ws, including selection) of a finite analytic
+    /// light's sample at pos_ws with normal normal_ws (zero for point lights, whose position is a delta: the
+    /// selection probability is returned).
+    public float eval_analytic_pdf(
+        const LightSampleContext ctx,
+        const uint light_index,
+        const float3 emitter_pos_ws,
+        const float3 emitter_normal_ws
+    );
+
+    /// Selects an emitter for emission (light tracing), independently of a receiving point: type and index
+    /// (analytic: LightID; environment: environment light index; emissive triangle: EmissiveTriangleID) with
+    /// probability pmf.
+    public bool sample_emitter(const float u, out EmitterType type, out uint index, out float pmf);
+
+    /// Probability of sample_emitter() selecting an emitter.
+    public float eval_emitter_pmf(const EmitterType type, const uint index);
 }
 
 namespace detail {
@@ -67,6 +85,37 @@ EmitterTypePMF compute_emitter_type_pmf(
     }
     pmf.environment = has_environment_lights ? 1.0 - finite_probability : 0.0;
     return pmf;
+}
+
+/// Next-event PDF (solid angle at the receiver) of an analytic light's own position sampling, without selection.
+float eval_analytic_light_pdf(const LightSampleContext ctx, const uint light_index, const float3 pos_ws,
+                              const float3 normal_ws)
+{
+    const LightData data = g_scene.light_system.light_data[light_index];
+    const LightType type = LightType(reinterpret<uint>(data.header));
+    if (type == LightType::point_light)
+        return 1.0;
+    float area = 0.0;
+    if (type == LightType::disk_light)
+        area = reinterpret<DiskLight>(data).surface_area;
+    else if (type == LightType::rect_light)
+        area = reinterpret<RectLight>(data).surface_area;
+    else if (type == LightType::sphere_light) {
+        const SphereLight sphere = reinterpret<SphereLight>(data);
+        area = sphere.surface_area;
+        if (sphere.enable_virtual_sphere_shrinking) {
+            const float d2 = dot(ctx.pos_ws - sphere.center_ws, ctx.pos_ws - sphere.center_ws);
+            const float r2 = sphere.radius_ws * sphere.radius_ws;
+            area *= min(r2, 0.99 * d2) / max(r2, 1e-30);
+        }
+    } else
+        return 0.0;
+    const float3 to_light = pos_ws - ctx.pos_ws;
+    const float d2 = max(dot(to_light, to_light), 1.0e-9);
+    const float cos_on_light = dot(normal_ws, -to_light * rsqrt(d2));
+    if (!(cos_on_light > 0.0) || !(area > 0.0))
+        return 0.0;
+    return d2 / (cos_on_light * area);
 }
 
 } // namespace detail
@@ -134,6 +183,58 @@ public struct UniformLightSampler : ILightSampler
 
     /// Evaluates the selection PDF for a source known to be valid.
     public float eval_source_selection_pdf() { return 1.0 / float(get_source_count()); }
+
+    public float eval_analytic_pdf(
+        const LightSampleContext ctx,
+        const uint light_index,
+        const float3 emitter_pos_ws,
+        const float3 emitter_normal_ws
+    )
+    {
+        if (light_index >= g_scene.light_system.analytic_light_count)
+            return 0.0;
+        return eval_source_selection_pdf()
+            * detail::eval_analytic_light_pdf(ctx, light_index, emitter_pos_ws, emitter_normal_ws);
+    }
+
+    public bool sample_emitter(const float u, out EmitterType type, out uint index, out float pmf)
+    {
+        type = EmitterType::unknown;
+        index = 0;
+        pmf = 0.0;
+        const uint source_count = get_source_count();
+        if (source_count == 0)
+            return false;
+        const uint analytic_light_count = g_scene.light_system.analytic_light_count;
+        const uint environment_light_count = g_scene.light_system.environment_light_count;
+        const uint source_index = min(uint(u * source_count), source_count - 1);
+        pmf = 1.0 / float(source_count);
+        if (source_index < analytic_light_count) {
+            type = EmitterType::analytic;
+            index = source_index;
+        } else if (source_index < analytic_light_count + environment_light_count) {
+            type = EmitterType::environment;
+            index = source_index - analytic_light_count;
+        } else {
+            type = EmitterType::emissive_triangle;
+            index = uint(g_scene.emissive_geometry.active_triangle_id_to_triangle_id[
+                source_index - analytic_light_count - environment_light_count]);
+        }
+        return true;
+    }
+
+    public float eval_emitter_pmf(const EmitterType type, const uint index)
+    {
+        const uint source_count = get_source_count();
+        if (source_count == 0)
+            return 0.0;
+        if (type == EmitterType::emissive_triangle) {
+            if (index >= g_scene.emissive_geometry.triangle_count
+                || g_scene.emissive_geometry.triangle_id_to_active_triangle_id[index] == ActiveEmissiveTriangleID::invalid)
+                return 0.0;
+        }
+        return 1.0 / float(source_count);
+    }
 
     float eval_environment_mixture_pdf(const LightSampleContext ctx, const float3 dir_ws)
     {
@@ -265,6 +366,63 @@ public struct PowerLightSampler : ILightSampler
         if (type == EmitterType::emissive_triangle && emitter_type_pmf.emissive_triangle > 0.0)
             return emitter_type_pmf.emissive_triangle * emissive_triangle_distribution.eval_pdf(index);
         return 0.0;
+    }
+
+    public float eval_analytic_pdf(
+        const LightSampleContext ctx,
+        const uint light_index,
+        const float3 emitter_pos_ws,
+        const float3 emitter_normal_ws
+    )
+    {
+        if (light_index >= g_scene.light_system.analytic_light_count)
+            return 0.0;
+        return eval_source_selection_pdf(EmitterType::analytic, light_index)
+            * detail::eval_analytic_light_pdf(ctx, light_index, emitter_pos_ws, emitter_normal_ws);
+    }
+
+    public bool sample_emitter(const float u, out EmitterType type, out uint index, out float pmf)
+    {
+        type = EmitterType::unknown;
+        index = 0;
+        pmf = 0.0;
+        const detail::EmitterTypePMF emitter_type_pmf
+            = detail::compute_emitter_type_pmf(analytic_light_power, environment_light_power, emissive_triangle_power);
+        float v = u;
+        float selection = 0.0;
+        if (v < emitter_type_pmf.analytic) {
+            if (!analytic_light_distribution.sample(v / emitter_type_pmf.analytic, index, selection))
+                return false;
+            type = EmitterType::analytic;
+            pmf = emitter_type_pmf.analytic * selection;
+        } else if (v < 1.0 - emitter_type_pmf.environment) {
+            uint active_index;
+            if (!emissive_triangle_distribution.sample((v - emitter_type_pmf.analytic) / emitter_type_pmf.emissive_triangle,
+                                                       active_index, selection))
+                return false;
+            type = EmitterType::emissive_triangle;
+            index = uint(g_scene.emissive_geometry.active_triangle_id_to_triangle_id[active_index]);
+            pmf = emitter_type_pmf.emissive_triangle * selection;
+        } else {
+            if (!environment_light_distribution.sample(
+                    (v - (1.0 - emitter_type_pmf.environment)) / emitter_type_pmf.environment, index, selection))
+                return false;
+            type = EmitterType::environment;
+            pmf = emitter_type_pmf.environment * selection;
+        }
+        return pmf > 0.0;
+    }
+
+    public float eval_emitter_pmf(const EmitterType type, const uint index)
+    {
+        if (type != EmitterType::emissive_triangle)
+            return eval_source_selection_pdf(type, index);
+        if (index >= g_scene.emissive_geometry.triangle_count)
+            return 0.0;
+        const ActiveEmissiveTriangleID active = g_scene.emissive_geometry.triangle_id_to_active_triangle_id[index];
+        if (active == ActiveEmissiveTriangleID::invalid)
+            return 0.0;
+        return eval_source_selection_pdf(type, uint(active));
     }
 
     float eval_environment_mixture_pdf(const LightSampleContext ctx, const float3 dir_ws)
@@ -413,5 +571,72 @@ public struct HierarchicalLightSampler : ILightSampler
             return 0.0;
         return emissive_probability * triangle_selection_pdf
             * eval_emissive_triangle_pdf(ctx, triangle_id, emitter_pos_ws, emitter_normal_ws);
+    }
+
+    public float eval_analytic_pdf(
+        const LightSampleContext ctx,
+        const uint light_index,
+        const float3 emitter_pos_ws,
+        const float3 emitter_normal_ws
+    )
+    {
+        const float analytic_probability
+            = detail::compute_emitter_type_pmf(analytic_light_power, environment_light_power, emissive_triangle_power)
+                  .analytic;
+        if (light_index >= g_scene.light_system.analytic_light_count || analytic_probability <= 0.0)
+            return 0.0;
+        return analytic_probability * analytic_light_distribution.eval_pdf(light_index)
+            * detail::eval_analytic_light_pdf(ctx, light_index, emitter_pos_ws, emitter_normal_ws);
+    }
+
+    /// Emission selection: component lights by power as for next-event estimation; emissive triangles uniformly
+    /// among the active ones (the light tree's importance needs a receiving point).
+    public bool sample_emitter(const float u, out EmitterType type, out uint index, out float pmf)
+    {
+        type = EmitterType::unknown;
+        index = 0;
+        pmf = 0.0;
+        const detail::EmitterTypePMF emitter_type_pmf
+            = detail::compute_emitter_type_pmf(analytic_light_power, environment_light_power, emissive_triangle_power);
+        float selection = 0.0;
+        if (u < emitter_type_pmf.analytic) {
+            if (!analytic_light_distribution.sample(u / emitter_type_pmf.analytic, index, selection))
+                return false;
+            type = EmitterType::analytic;
+            pmf = emitter_type_pmf.analytic * selection;
+        } else if (u < 1.0 - emitter_type_pmf.environment) {
+            const uint count = g_scene.emissive_geometry.active_triangle_count;
+            if (count == 0)
+                return false;
+            const float v = (u - emitter_type_pmf.analytic) / emitter_type_pmf.emissive_triangle;
+            type = EmitterType::emissive_triangle;
+            index = uint(g_scene.emissive_geometry.active_triangle_id_to_triangle_id[min(uint(v * count), count - 1)]);
+            pmf = emitter_type_pmf.emissive_triangle / float(count);
+        } else {
+            if (!environment_light_distribution.sample(
+                    (u - (1.0 - emitter_type_pmf.environment)) / emitter_type_pmf.environment, index, selection))
+                return false;
+            type = EmitterType::environment;
+            pmf = emitter_type_pmf.environment * selection;
+        }
+        return pmf > 0.0;
+    }
+
+    public float eval_emitter_pmf(const EmitterType type, const uint index)
+    {
+        const detail::EmitterTypePMF emitter_type_pmf
+            = detail::compute_emitter_type_pmf(analytic_light_power, environment_light_power, emissive_triangle_power);
+        if (type == EmitterType::analytic)
+            return emitter_type_pmf.analytic * analytic_light_distribution.eval_pdf(index);
+        if (type == EmitterType::environment)
+            return emitter_type_pmf.environment * environment_light_distribution.eval_pdf(index);
+        if (type == EmitterType::emissive_triangle) {
+            const uint count = g_scene.emissive_geometry.active_triangle_count;
+            if (count == 0 || index >= g_scene.emissive_geometry.triangle_count
+                || g_scene.emissive_geometry.triangle_id_to_active_triangle_id[index] == ActiveEmissiveTriangleID::invalid)
+                return 0.0;
+            return emitter_type_pmf.emissive_triangle / float(count);
+        }
+        return 0.0;
     }
 }

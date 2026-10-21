@@ -19,11 +19,26 @@ from falcor2.psdr.openpbr import generate_openpbr_headers
 
 # Default vertex_grad_clamp (see PSDR.__init__); 0 disables the clamp.
 VERTEX_GRAD_CLAMP = 0.0
+# Shader parameters of the light term (light_paths.slang), bound only with light tracing on.
+LIGHT_TRACING_KEYS = {"light_tracing", "light_derivatives", "light_contribution_scale", "light_sample_weight",
+                      "light_mis_path_count", "light_emission", "light_primal", "light_interior"}
+# Camera sample i of a pass with seed s is the reference path tracer's frame s * FRAMES_PER_SEED + i (interior.slang).
+FRAMES_PER_SEED = 65536
+# Samples per pixel per dispatch of the per-pixel derivative kernels (long dispatches hit the GPU timeout).
+SAMPLES_PER_DISPATCH = 32
 
 
 class PSDR:
     """Renders a falcor2 scene from a camera: the primal image, forward-mode derivative images and backward-mode
     gradients (see falcor2.psdr).
+
+    The primal image is falcor2's forward renderer: the camera paths are ReferencePathTracerNode's (next-event
+    estimation and MIS on, its other defaults: interior tracking with homogeneous media, Russian roulette from
+    ``rr_depth`` (None: off), material opacity (cut-outs)) and, with light tracing, the light paths
+    AdjointPathTracerNode's. ``forward(spp, seed)["primal"]`` is the AccumulatorNode mean of the forward renderer's
+    frames seed * 65536 + i, i < spp, at max_depth = max_bounces + 1 (pixel-identical up to the compiled arithmetic and
+    the order of the light splats' float atomics). The derivatives (interior term) are those of the same path samples in
+    material form; volume scattering vertices, medium weights and Russian roulette are detached factors.
 
     ``light_sampler`` chooses the lights of next-event estimation (default: f2.PowerLightSampler, as the reference
     path tracer). Its emitted-power weights starve small lights next to a distant, physically large one (a sun
@@ -38,6 +53,13 @@ class PSDR:
     vertex gradient to vertex_grad_clamp / scene extent x its dL/dI-weighted contribution. Sharp glossy lobes make
     the material-form vertex derivative heavy-tailed (rare samples 10^3-10^4 x the mean); the clamp trades a small
     bias for bounded variance. Forward-mode derivative images are not clamped.
+
+    Light tracing (set_light_tracing(), off by default): light paths from the scene's lights connected to the camera
+    (falcor2's adjoint light tracer), combined with the camera paths' emission and next-event estimates by multiple
+    importance sampling as in bidirectional path tracing. They add the light that reaches the camera paths' surfaces
+    only through delta or peaked transmission (the sun through glass or sheer curtains) to the primal image and to the
+    interior term (material and light-emission derivatives; no geometric derivatives along light paths). See
+    slang/falcor2/psdr/light_paths.slang.
     """
 
     def __init__(
@@ -52,6 +74,7 @@ class PSDR:
         check_visibility: bool = False,
         light_sampler: Optional[f2.LightSampler] = None,
         photon_count: int = PHOTON_EMISSIONS,
+        rr_depth: Optional[int] = 3,
     ):
         if not 0 <= max_bounces <= MAX_DEPTH:
             raise ValueError(f"max_bounces must be in [0, {MAX_DEPTH}]")
@@ -68,9 +91,11 @@ class PSDR:
         prelude = (self._light_sampler.shader_specialization_source
                    + f"export struct LightSampler : ILightSampler = {self._light_sampler.slang_type_name};\n")
         has_openpbr = "OpenPBRMaterial" in type_ids
+        has_spongecake = "SpongeCakeMaterial" in type_ids
 
         def query(name, backward=False):
-            constants = {"has_openpbr": has_openpbr, "normal_maps": self._normal_maps, "backward": backward}
+            constants = {"has_openpbr": has_openpbr, "has_spongecake": has_spongecake, "normal_maps": self._normal_maps,
+                         "backward": backward}
             function = getattr(module, name).constants(constants).prelude(prelude).type_conformances(conformances)
             return function.write(self._helper.bind_scene)
 
@@ -104,7 +129,10 @@ class PSDR:
         ids = [type_ids.get(name, NO_SLOT) for name in ("StandardMaterial", "OpenPBRMaterial")]
         for m in materials:
             for role, name in enumerate(MATERIAL_TEXTURES.get(m.slang_type_name, ())):
-                info = query("material_texture")(m.material_id, role, *ids)
+                if m.slang_type_name == "SpongeCakeMaterial":
+                    info = query("spongecake_texture")(m.material_id, role, type_ids["SpongeCakeMaterial"])
+                else:
+                    info = query("material_texture")(m.material_id, role, *ids)
                 index, width, height = np.asarray(info, np.uint32).tolist()
                 if index != NO_SLOT:
                     self._textures[m.material_id, name], sizes[index] = index, (height, width)
@@ -113,18 +141,15 @@ class PSDR:
             if index != NO_SLOT:
                 self._textures[id(self.lights[env_map_id])], sizes[index] = index, (height, width)
         self._normal_maps = any(isinstance(key, tuple) and key[1] == "normal" for key in self._textures)
-        slot = light_slot_base + LIGHT_SLOTS * len(self.lights)
-        self._texels = {}
-        for index, (height, width) in sorted(sizes.items()):
-            self._texels[index] = (slot, height, width)
-            slot += 4 * width * height
-        self.param_count = slot
-        texel_slots = np.full(max(self._texels, default=0) + 1, NO_SLOT, np.uint32)
-        for index, (first, _, _) in self._texels.items():
-            texel_slots[index] = first
+        self._texel_base = light_slot_base + LIGHT_SLOTS * len(self.lights)
+        self._texture_sizes, self._texel_request = sizes, None
+        texel_slots = self._layout_texels(None)
+        # Gradient buffers holding accumulate=True passes not yet read by gradients().
+        self._grads_pending = False
 
         self._topology = {}
         self._vertex_query = None
+        self._edges_stale = False
         self._build_edges()
         if ray_epsilon is None:
             extent = max((np.abs(self._positions[g]).max() for g in self._positions), default=1.0)
@@ -145,20 +170,27 @@ class PSDR:
             "dl_di": buffer(np.zeros((self.width * self.height, 3), np.float32)),
             "texel_slots": buffer(texel_slots),
         }
-        for name in ("primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary"):
+        for name in ("primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
+                     "light_interior", "primal_sum", "primal_residual"):
             self._buffers[name] = buffer(np.zeros((self.width * self.height, 3), np.float32))
+
         self._globals = {
             "max_bounces": max_bounces,
+            "rr_depth": 0xFFFFFFFF if rr_depth is None else max(1, int(rr_depth)),
             "ray_epsilon": float(ray_epsilon),
             "standard_type_id": type_ids.get("StandardMaterial", 0xFFFFFFFF),
             "openpbr_type_id": type_ids.get("OpenPBRMaterial", 0xFFFFFFFF),
+            "spongecake_type_id": type_ids.get("SpongeCakeMaterial", 0xFFFFFFFF),
             "light_slot_base": light_slot_base,
             "texel_slot_count": len(texel_slots),
             "env_map_id": env_map_id,
             "photon_radius": float(photon_radius),
             "max_relative_vertex_derivative": float(vertex_grad_clamp) / self._scene_extent,
             "check_visibility": check_visibility,
+            "light_tracing": False,
+            "light_derivatives": False,
         }
+        self._light_tracing = None
         # Kernels by (name, backward), compiled on first use.
         self._kernels = {}
         self.photon_count = photon_count
@@ -179,22 +211,75 @@ class PSDR:
         self._photon_accel = None
 
     @property
+    def light_tracing(self) -> Optional[dict]:
+        """Light-tracing settings (see set_light_tracing()), or None (off)."""
+        return self._light_tracing
+
+    def set_light_tracing(self, paths_per_pixel: float = 1.0, target=None, **_unused):
+        """Light paths from the scene's lights (see the class docstring); paths_per_pixel <= 0 turns them off.
+
+        paths_per_pixel: light paths per pixel and sample (spp). target: ((x, y, z), radius) sphere that finite lights
+        outside it aim their light paths at, e.g. around the windows, or None for the scene's bounding sphere (light
+        leaving outside it is covered by the camera paths only: its light-tracing density is zero).
+        """
+        if paths_per_pixel is None or paths_per_pixel <= 0:
+            self._light_tracing = None
+            self._globals["light_tracing"] = False
+            return
+        self._light_tracing = dict(paths_per_pixel=float(paths_per_pixel), target=target)
+        self._globals["light_tracing"] = True
+        self._update_light_emission()
+
+    def _light_path_count(self) -> int:
+        """Light paths per frame (AdjointPathTracerNode's count)."""
+        return int(round(self._light_tracing["paths_per_pixel"] * self.width * self.height))
+
+    def _update_light_emission(self):
+        """Emission settings of the light term from the scene's current bounds (as AdjointPathTracerNode's)."""
+        from falcor2.rendernodes.adjoint_pathtracer_node import scene_bounding_sphere
+
+        center, radius = scene_bounding_sphere(self.scene)
+        target = self._light_tracing["target"]
+        if target is None:
+            target = (center, radius)
+        count = self._light_path_count()
+        self._globals.update(
+            light_mis_path_count=float(count),
+            light_contribution_scale=1.0 / count if count > 0 else 0.0,
+            light_emission={
+                "target_center": spy.float3(*map(float, target[0])),
+                "target_radius": float(target[1]),
+                "scene_center": spy.float3(*map(float, center)),
+                "scene_radius": float(radius),
+            },
+        )
+
+    @property
     def photon_edge_count(self) -> int:
         """Number of edges the secondary-edge photons are sampled on."""
+        self._update_edges()
         return len(self._photon)
 
     @property
     def photon_edge_length(self) -> float:
         """Total length of the edges the secondary-edge photons are sampled on."""
+        self._update_edges()
         return self._photon_length
 
     def update(self, geometry: bool = True):
         """Refresh the scene-dependent state after ``scene.update()``: light values and, with geometry, the
-        edge lists (needed after vertex or transform changes)."""
+        edge lists (needed after vertex or transform changes; rebuilt when a pass next samples edges)."""
         if geometry:
             self._refresh_layout()
-            self._build_edges()
+            self._edges_stale = True
         self._upload_scene_state()
+
+    def _update_edges(self):
+        """Rebuilds stale edge lists (only the primary and secondary terms sample them)."""
+        if self._edges_stale:
+            self._build_edges()
+            self._edges_stale = False
+            self._upload_edges()
 
     def _refresh_layout(self):
         """falcor2 moves a mesh in the global vertex buffer when its vertices are rewritten: re-read the instances'
@@ -208,6 +293,8 @@ class PSDR:
         info = {gid: np.asarray(row, dtype=np.uint32) for gid, row in zip(gids, rows)}
         if all(np.array_equal(info[gid], self._info[gid]) for gid in gids):
             return
+        if self._grads_pending:
+            raise RuntimeError("The vertex layout changed with accumulated gradients unread: call gradients() first")
         self._info = info
         self.vertex_count = int(max(int(i[0] + i[1]) for i in info.values()))
         n = max(1, self.vertex_count)
@@ -228,6 +315,10 @@ class PSDR:
         self._light_sampler.update(self.scene)
         values = [light_emission(light) for light in self.lights] or [[0.0, 0.0, 0.0]]
         self._write_buffer("light_value", np.asarray(values, np.float32))
+        if not self._edges_stale:
+            self._upload_edges()
+
+    def _upload_edges(self):
         self._write_buffer("primary_edges", self._primary)
         self._write_buffer("photon_edges", self._photon)
         self._globals.update(primary_edge_count=len(self._primary), primary_edge_length=self._primary_length,
@@ -255,8 +346,44 @@ class PSDR:
         """Parameter slots of the texels of a material's texture (see MATERIAL_TEXTURES) or of an EnvMapLight's
         map: (height, width, 4) linear RGBA values in row-major order."""
         key = id(owner) if isinstance(owner, f2.Light) else (owner.material_id, name)
-        first, height, width = self._texels[self._textures[key]]
+        index = self._textures[key]
+        if index not in self._texels:
+            raise KeyError(f"Texture {key} has no texel parameters (see set_texel_gradients())")
+        first, height, width = self._texels[index]
         return slice(first, first + 4 * width * height)
+
+    def set_texel_gradients(self, owners=None):
+        """Texel parameters (gradients, tangents, texture_slot()) only for the textures of ``owners``, keys as
+        texture_slot() takes them: (material, name) pairs or EnvMapLights; None (the default): every texture. The other
+        textures cost no texel derivatives or gradient memory (a scene's textures can need gigabytes of slots)."""
+        indices = None
+        if owners is not None:
+            keys = [id(o) if isinstance(o, f2.Light) else (o[0].material_id, o[1]) for o in owners]
+            indices = frozenset(self._textures[k] for k in keys if k in self._textures)
+        if indices == self._texel_request:
+            return
+        if self._grads_pending:
+            raise RuntimeError("The texel layout changed with accumulated gradients unread: call gradients() first")
+        self._texel_request = indices
+        self._write_buffer("texel_slots", self._layout_texels(indices))
+        n = max(1, self.param_count)
+        for name in ("param_tangent", "param_grad"):
+            if self._buffers[name].size != 4 * n:
+                self._buffers[name] = self._buffer(np.zeros(n, np.float32))
+
+    def _layout_texels(self, indices) -> np.ndarray:
+        """Texel slots of the textures with these indices (None: every texture), packed after the light slots in
+        texture order; returns the texel slot table (NO_SLOT: no texel derivatives) and sets param_count."""
+        slot, self._texels = self._texel_base, {}
+        for index, (height, width) in sorted(self._texture_sizes.items()):
+            if indices is None or index in indices:
+                self._texels[index] = (slot, height, width)
+                slot += 4 * width * height
+        self.param_count = slot
+        table = np.full(max(self._texture_sizes, default=0) + 1, NO_SLOT, np.uint32)
+        for index, (first, _, _) in self._texels.items():
+            table[index] = first
+        return table
 
     def set_tangents(self, vertex: Optional[np.ndarray] = None, params: Optional[np.ndarray] = None):
         """Forward-mode direction: object-space vertex tangents (V, 3) and parameter tangents (P,)."""
@@ -282,19 +409,40 @@ class PSDR:
         images = {"primal": self._image("primal")}
         for term, name in zip(TERMS, ("interior", "pixel_boundary", "primary_boundary", "secondary_boundary")):
             images[term] = self._image(name) if term in terms else np.zeros_like(images["primal"])
+        if self._light_tracing is not None and "interior" in terms:
+            images["interior"] += self._image("light_interior")
         images["total"] = sum(images[term] for term in TERMS)
         return images
 
-    def backward(self, dl_di: np.ndarray, spp: int = 1, seed: int = 0, terms=TERMS, antithetic=True):
-        """Gradients (vertex (V, 3), params (P,)) of L given dL/dI (H, W, 3); ``antithetic`` as in forward()."""
+    def backward(self, dl_di: np.ndarray, spp: int = 1, seed: int = 0, terms=TERMS, antithetic=True,
+                 accumulate: bool = False):
+        """Gradients (vertex (V, 3), params (P,)) of L given dL/dI (H, W, 3); ``antithetic`` as in forward().
+
+        ``accumulate``: the pass's gradients stay on the GPU, added to those of the previous accumulate passes, and
+        backward() returns None; gradients() reads the sum (e.g. once per multi-view iteration, instead of reading
+        param_count floats back per view)."""
+        if self._grads_pending and not accumulate:
+            raise RuntimeError("Accumulated gradients unread: call gradients() first")
         dl_di = np.ascontiguousarray(dl_di, np.float32).reshape(-1, 3)
         self._buffers["dl_di"].copy_from_numpy(dl_di)
-        self._run(True, spp, seed, terms, antithetic)
+        self._run(True, spp, seed, terms, antithetic, clear_gradients=not self._grads_pending)
+        if accumulate:
+            self._grads_pending = True
+            return None
+        return self._read_gradients()
+
+    def gradients(self):
+        """The gradients (vertex (V, 3), params (P,)) summed over the backward(accumulate=True) passes since the last
+        call; the next accumulate pass starts from zero."""
+        self._grads_pending = False
+        return self._read_gradients()
+
+    def _read_gradients(self):
         vertex = self._buffers["vertex_grad"].to_numpy().view(np.float32)[: 3 * self.vertex_count]
         params = self._buffers["param_grad"].to_numpy().view(np.float32)[: self.param_count]
-        return vertex.reshape(-1, 3).copy(), params.copy()
+        return vertex.reshape(-1, 3), params  # views of fresh readback arrays (no copy)
 
-    def _run(self, backward: bool, spp: int, seed: int, terms, antithetic):
+    def _run(self, backward: bool, spp: int, seed: int, terms, antithetic, clear_gradients: bool = True):
         if spp <= 0:
             raise ValueError("spp must be positive")
         # Pixel-boundary samples per perimeter position; camera paths have antithetic partners with any of them.
@@ -302,18 +450,45 @@ class PSDR:
         if boundary_samples not in (1, 2, 4):
             raise ValueError("antithetic must be True, False, 2 or 4")
         paths = boundary_samples > 1
+        if "primary" in terms or "secondary" in terms:
+            self._update_edges()
+        names = ["primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
+                 "light_interior"]
+        if backward and clear_gradients:  # only backward passes write them (forward ones keep accumulated gradients)
+            names += ["vertex_grad", "param_grad"]
         encoder = self.device.create_command_encoder()
-        for name in ("primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary",
-                     "vertex_grad", "param_grad"):
+        for name in names:
             encoder.clear_buffer(self._buffers[name])
         self.device.submit_command_buffer(encoder.finish())
         pixels = spy.grid((self.height, self.width))
-        if not backward:
-            self._call("render_primal", False, seed, pixel=pixels, spp=spp, antithetic=paths)
+        light = self._light_tracing is not None and (not backward or "interior" in terms)
+        if light:
+            self._update_light_emission()
+            self._globals.update(light_derivatives="interior" in terms, light_sample_weight=1.0 / spp)
+            count = self._light_path_count()
+            if count > 1 << 24:
+                raise ValueError("At most 2^24 light paths per frame")
+        # Frame by frame, as the forward renderer: the frame's light paths (splats into light_primal; their derivatives
+        # into light_interior or the gradients), then the camera paths, accumulated into the primal image.
+        for i in range(spp):
+            frame = (seed * FRAMES_PER_SEED + i) & 0xFFFFFFFF
+            if light:
+                if not backward:
+                    encoder = self.device.create_command_encoder()
+                    encoder.clear_buffer(self._buffers["light_primal"])
+                    self.device.submit_command_buffer(encoder.finish())
+                if count > 0:
+                    self._call("render_light", backward, seed, tid=spy.grid((count,)), count=count, frame=frame)
+            if not backward:
+                self._call("render_primal", False, seed, pixel=pixels, frame=frame, sample_index=i)
         if "interior" in terms:
-            self._call("render_interior", backward, seed, pixel=pixels, spp=spp, antithetic=paths)
+            for first in range(0, spp, SAMPLES_PER_DISPATCH):
+                self._call("render_interior", backward, seed, pixel=pixels, spp=spp, first=first,
+                           count=min(SAMPLES_PER_DISPATCH, spp - first), antithetic=paths)
         if "pixel" in terms:
-            self._call("render_pixel_boundary", backward, seed, pixel=pixels, spp=spp, antithetic=boundary_samples)
+            for first in range(0, spp, SAMPLES_PER_DISPATCH):
+                self._call("render_pixel_boundary", backward, seed, pixel=pixels, spp=spp, first=first,
+                           count=min(SAMPLES_PER_DISPATCH, spp - first), antithetic=boundary_samples)
         if "primary" in terms and len(self._primary):
             samples = self.width * self.height * spp
             for offset in range(0, samples, 1 << 22):
@@ -331,10 +506,14 @@ class PSDR:
             cursor["camera"] = self.camera
             cursor["seed"] = seed
             cursor["light_sampler"] = self._light_sampler
+            # The light-tracing state is bound only with light tracing on (older shader modules lack it).
+            light = self._light_tracing is not None
             for key, value in self._globals.items():
-                cursor[key] = value
+                if light or key not in LIGHT_TRACING_KEYS:
+                    cursor[key] = value
             for key, value in self._buffers.items():
-                cursor[key] = value
+                if light or key not in LIGHT_TRACING_KEYS:
+                    cursor[key] = value
             if self._photon_accel is not None:
                 cursor["photon_tlas"] = self._photon_accel[2]
 

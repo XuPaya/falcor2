@@ -263,6 +263,8 @@ target_sources(falcor2 PRIVATE
 
     render/material/openpbr_material.cpp
     render/material/openpbr_material.h
+    render/material/spongecake_material.cpp
+    render/material/spongecake_material.h
     render/material/mtlx/dielectric_lut_globals.cpp
     render/material/mtlx/dielectric_lut_globals.h
     render/material/mtlx/lut_globals.cpp

@@ -285,11 +285,16 @@ public void render_secondary(uint2 pixel, uint spp_index, uint spp)
     for (uint k = 0; k < rec.length; k++) {
         LightRecord l = rec.light[k];
         VertexTerms t = rec.terms[k];
+        if (is_volume_vertex(rec, k)) {
+            // Medium scattering vertex: no surface, no edges seen from it.
+            root *= t.step;
+            continue;
+        }
         if (l.kind == LIGHT_TRIANGLE)
             result += segment_gradient(rec.hit[k], mesh_source(l.hit), root * t.nee, adjoint);
         else if (l.kind != LIGHT_NONE)
             result += segment_gradient(rec.hit[k], light_source(l, load_vertex(0, rec.hit[k]).p), root * t.nee, adjoint);
-        if (k + 1 < rec.length && rec.pdf[k + 1] > 0)
+        if (k + 1 < rec.length && rec.pdf[k + 1] > 0 && !is_volume_vertex(rec, k + 1))
             result += segment_gradient(rec.hit[k], mesh_source(rec.hit[k + 1]), root * t.step * suffix[k + 1], adjoint);
         else if (k + 1 == rec.length && rec.miss_pdf > 0)
             result += segment_gradient(rec.hit[k], direction_source(rec.miss_dir), root * t.step, adjoint);

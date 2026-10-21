@@ -38,12 +38,24 @@ MATERIAL_PARAMS = {
     "OpenPBRMaterial": dict(zip(_OPENPBR_ATTRIBUTES, np.cumsum(
         [0] + [3 if name in _OPENPBR_COLORS else 1 for name in _OPENPBR_ATTRIBUTES[:-1]]).tolist()))
     | {"normal_texture_scale": 44, "subsurface_weight": 45, "subsurface_color": 46, "subsurface_scatter_anisotropy": 49},
+    "SpongeCakeMaterial": {
+        "albedo": 0,
+        "thickness": 3,
+        "roughness": 4,
+        "top_albedo": 5,
+        "top_thickness": 8,
+        "top_roughness": 9,
+        "base_color": 10,
+        "base_weight": 13,
+        "normal_texture_scale": 14,
+    },
 }
 # Textures with texel parameters (see material_texture() in slang/falcor2/psdr/queries.slang).
 MATERIAL_TEXTURES = {
     "StandardMaterial": ("base_color", "metallic_roughness", "emissive", "normal", "transmission"),
     "OpenPBRMaterial": tuple(_OPENPBR_ATTRIBUTES) + ("normal", "subsurface_weight", "subsurface_color",
                                                      "subsurface_scatter_anisotropy"),
+    "SpongeCakeMaterial": ("albedo", "top_albedo", "base_color", "normal"),
 }
 # Analytic lights: emission and world-space translation. Environment map: intensity and rotation (a rotation
 # vector in world space, applied before the map's orientation).

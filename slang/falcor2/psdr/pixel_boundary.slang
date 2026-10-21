@@ -44,13 +44,14 @@ float3 pixel_sample(uint2 pixel, float u, float3 adjoint, inout UniformSampleGen
     return value * velocity * weight;
 }
 
-/// `antithetic` samples (1, 2 or 4) per perimeter position: see antithetic_position().
-public void render_pixel_boundary(uint2 pixel, uint spp, uint antithetic)
+/// `antithetic` samples (1, 2 or 4) per perimeter position: see antithetic_position(). Samples first, ...,
+/// first + count - 1 of spp.
+public void render_pixel_boundary(uint2 pixel, uint spp, uint first, uint count, uint antithetic)
 {
     uint index = pixel.y * camera.dims.x + pixel.x;
     float3 adjoint = backward ? dl_di[index] / spp : float3(0);
     float3 boundary = 0;
-    for (uint i = 0; i < spp; i++) {
+    for (uint i = first; i < first + count; i++) {
         UniformSampleGenerator sp = UniformSampleGenerator(pixel, 0x80000000 | (seed * spp + i));
         float u = next_float(sp);
         // Antithetic samples share their other random numbers. One call site keeps the kernel small.
@@ -61,5 +62,5 @@ public void render_pixel_boundary(uint2 pixel, uint spp, uint antithetic)
         }
     }
     if (!backward)
-        pixel_boundary[index] = boundary / spp;
+        pixel_boundary[index] += boundary / spp;
 }

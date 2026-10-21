@@ -1309,6 +1309,41 @@ def test_material_interior_medium(device_type: spy.DeviceType) -> None:
 
 
 @pytest.mark.parametrize("device_type", helpers.DEFAULT_DEVICE_TYPES)
+def test_openpbr_subsurface_volume_radius(device_type: spy.DeviceType) -> None:
+    """Non-thin OpenPBR subsurface becomes an interior medium whose extinction is 1 / (radius * radius_scale)."""
+    device = helpers.get_device(device_type)
+    scene = f2.Scene.create(device)
+
+    def subsurface(radius: float) -> f2.Material:
+        return scene.create_material(
+            "OpenPBRMaterial",
+            f2.Properties(
+                {
+                    "subsurface_weight": 1.0,
+                    "subsurface_color": spy.float3(0.8, 0.6, 0.4),
+                    "subsurface_scatter_anisotropy": 0.2,
+                    "subsurface_radius": radius,
+                    "subsurface_radius_scale": spy.float3(1.0, 0.5, 0.25),
+                }
+            ),
+        )
+
+    near, far = subsurface(0.5), subsurface(1.0)
+    scene.update()
+    module, helper = load_scene_sampling_module(device, scene)
+
+    m_near = _read_interior_medium(module, helper, near)
+    m_far = _read_interior_medium(module, helper, far)
+    extinction = _float3_array(m_near["sigma_a"]) + _float3_array(m_near["sigma_s"])
+    assert extinction == pytest.approx([2.0, 4.0, 8.0], rel=5e-3)
+    assert float(m_near["anisotropy"]) == pytest.approx(0.2, abs=1e-3)
+    albedo = _float3_array(m_near["sigma_s"]) / extinction
+    assert np.all(np.diff(albedo) < 0)  # brighter subsurface colour -> higher single-scattering albedo
+    assert _float3_array(m_far["sigma_s"]) == pytest.approx(0.5 * _float3_array(m_near["sigma_s"]), rel=5e-3)
+    assert _float3_array(m_far["sigma_a"]) == pytest.approx(0.5 * _float3_array(m_near["sigma_a"]), rel=5e-3, abs=1e-5)
+
+
+@pytest.mark.parametrize("device_type", helpers.DEFAULT_DEVICE_TYPES)
 def test_mdl_material_interior_medium(device_type: spy.DeviceType) -> None:
     device = helpers.get_device(device_type)
     scene = f2.Scene.create(device)

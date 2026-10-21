@@ -323,6 +323,9 @@ public struct OpenPBRMaterial : IMaterial
         FloatAttribute subsurface_weight;
         Float3Attribute subsurface_color;
         FloatAttribute subsurface_scatter_anisotropy;
+        // Subsurface volume (appended last: PSDR reads the attributes above as a prefix of this layout)
+        FloatAttribute subsurface_radius;
+        Float3Attribute subsurface_radius_scale;
     };
 
     public MaterialHeader header;
@@ -419,6 +422,8 @@ public struct OpenPBRMaterial : IMaterial
         mi.inputs.subsurface_color = eval_attribute(attributes.subsurface_color, si.uv, lod_sampler);
         mi.inputs.subsurface_scatter_anisotropy
             = eval_attribute(attributes.subsurface_scatter_anisotropy, si.uv, lod_sampler);
+        mi.inputs.subsurface_radius = eval_attribute(attributes.subsurface_radius, si.uv, lod_sampler);
+        mi.inputs.subsurface_radius_scale = eval_attribute(attributes.subsurface_radius_scale, si.uv, lod_sampler);
 
         // Geometry
         // inputs.geometry_opacity = 1.0f;

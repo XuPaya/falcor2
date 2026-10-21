@@ -3,14 +3,15 @@
 
 implementing psdr;
 
-// Materials: shading frames and StandardMaterial BSDFs and emission with derivatives (OpenPBRMaterial in
-// openpbr.slang). Other materials are evaluated without derivatives.
+// Materials: shading frames and StandardMaterial and SpongeCakeMaterial BSDFs and emission with derivatives
+// (OpenPBRMaterial in openpbr.slang). Other materials are evaluated without derivatives.
 
 static const uint MATERIAL_OTHER = 0;
 /// Same material hints as the reference path tracer.
 static const MaterialInstanceHints SHADING_HINTS = MaterialInstanceHints::adjust_shading_normal;
 static const uint MATERIAL_STANDARD = 1;
 static const uint MATERIAL_OPENPBR = 2;
+static const uint MATERIAL_SPONGECAKE = 3;
 
 /// Non-differentiable shading context of a path vertex, built from the primal incident direction.
 struct Surface
@@ -22,12 +23,15 @@ struct Surface
     StandardMaterial standard;
     StandardMaterialInstance standard_instance;
     OpenPBRMaterial openpbr;
+    SpongeCakeMaterial spongecake;
 };
 
-Surface make_surface(HitRef h, float3 wi_ws)
+/// exterior_ior: the IOR outside the surface (the path tracer's interior tracking).
+Surface make_surface(HitRef h, float3 wi_ws, float exterior_ior = 1.0)
 {
     Surface s = {};
     s.si = g_scene.make_triangle_surface_interaction(TriangleHitInfo(h.gid, h.prim, h.bary), wi_ws);
+    s.si.exterior_ior = exterior_ior;
     s.material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
     s.slot = uint(s.material) * MATERIAL_SLOTS;
     MaterialData data = g_scene.material_system.get_material_data(s.material);
@@ -38,6 +42,9 @@ Surface make_surface(HitRef h, float3 wi_ws)
     } else if (has_openpbr && data.header.type_id == openpbr_type_id) {
         s.kind = MATERIAL_OPENPBR;
         s.openpbr = reinterpret<OpenPBRMaterial>(data);
+    } else if (has_spongecake && data.header.type_id == spongecake_type_id) {
+        s.kind = MATERIAL_SPONGECAKE;
+        s.spongecake = reinterpret<SpongeCakeMaterial>(data);
     }
     return s;
 }
@@ -119,6 +126,50 @@ StandardBSDFData standard_bsdf_data(float theta, no_diff Surface s)
     return data;
 }
 
+[Differentiable]
+Frame spongecake_frame(float theta, no_diff Surface s)
+{
+    SpongeCakeMaterial m = s.spongecake;
+    float4 sampled = m.normal_texture.sample(ExplicitLodSampler(), s.si.uv, float4(0.0, 0.0, 1.0, 0.0));
+    return shading_frame(theta, s, m.normal_texture.data, sampled, param(theta, m.normal_texture_scale, s.slot + 14),
+                         true);
+}
+
+/// SpongeCakeMaterial.setup_material_instance() with its factors and texels routed through param(). The tables'
+/// derivatives (thicknesses and roughnesses) enter through table_tangent.
+[Differentiable]
+SpongeCakeBSDF spongecake_bsdf(float theta, no_diff Surface s)
+{
+    SpongeCakeMaterial m = s.spongecake;
+    float2 uv = s.si.uv;
+    ExplicitLodSampler lod = ExplicitLodSampler();
+    SpongeCakeBSDF b;
+    b.body.albedo = saturate(texture_param(theta, m.albedo_texture.data, uv,
+                                           m.albedo_texture.sample(lod, uv, float4(1.0))).rgb
+                             * param3(theta, m.albedo, s.slot));
+    b.body.tau = max(param(theta, m.thickness, s.slot + 3), 0.0);
+    b.body.alpha = clamp(param(theta, m.roughness, s.slot + 4), 0.01, 1.0);
+    b.body.fiber = (m.layer_flags & 1) != 0;
+    b.body.hg = (m.layer_flags & 8) != 0;
+    b.top.albedo = saturate(texture_param(theta, m.top_albedo_texture.data, uv,
+                                          m.top_albedo_texture.sample(lod, uv, float4(1.0))).rgb
+                            * param3(theta, m.top_albedo, s.slot + 5));
+    b.top.tau = max(param(theta, m.top_thickness, s.slot + 8), 0.0);
+    b.top.alpha = clamp(param(theta, m.top_roughness, s.slot + 9), 0.01, 1.0);
+    b.top.fiber = (m.layer_flags & 2) != 0;
+    b.top.hg = (m.layer_flags & 16) != 0;
+    b.base_color = saturate(texture_param(theta, m.base_color_texture.data, uv,
+                                          m.base_color_texture.sample(lod, uv, float4(1.0))).rgb
+                            * param3(theta, m.base_color, s.slot + 10));
+    b.base_weight = saturate(param(theta, m.base_weight, s.slot + 13));
+    b.delta_transmission = (m.layer_flags & 4) != 0;
+    b.forward_lobes = (m.layer_flags & 32) != 0;
+    b.tables = m.tables;
+    b.table_tangent = float4(b.top.tau - detach(b.top.tau), b.top.alpha - detach(b.top.alpha),
+                             b.body.tau - detach(b.body.tau), b.body.alpha - detach(b.body.alpha));
+    b.table_derivatives = true;
+    return b;
+}
 
 /// BSDF values including outgoing foreshortening for two outgoing directions (world-space and normalized,
 /// or zero for a zero value), sharing the BSDF setup. Other materials return `other1` and `other2`, their
@@ -142,18 +193,48 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
             f2 = bsdf.eval(wi_ls, wo_ls2, sg, BSDFContext());
     } else if (has_openpbr && s.kind == MATERIAL_OPENPBR) {
         eval_openpbr(theta, s, wi_ws, wo1, wo2, f1, f2);
+    } else if (has_spongecake && s.kind == MATERIAL_SPONGECAKE) {
+        Frame frame = spongecake_frame(theta, s);
+        float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
+        SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
+        Frame primal = detach(frame);
+        if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls1, wo1))
+            f1 = bsdf.eval(wi_ls, wo_ls1);
+        if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls2, wo2))
+            f2 = bsdf.eval(wi_ls, wo_ls2);
     } else {
         f1 = other1;
         f2 = other2;
     }
 }
 
-/// Radiance emitted by a surface towards `to_ws` (unnormalized). Emission is front-facing only.
-/// Other materials return `other`, their recorded emitted radiance.
+/// Derivative carrier (value 1) of a delta transmission sampled at a vertex seen from `wi_ws`: SpongeCakeMaterial's
+/// unscattered transmittance (1 - base weight) exp(-sum tau lambda(wi)) over its primal value. Other materials' delta
+/// lobes have no derivatives.
+[Differentiable]
+float delta_scale(float theta, no_diff Surface s, float3 wi_ws)
+{
+    if (!(has_spongecake && s.kind == MATERIAL_SPONGECAKE))
+        return 1.0;
+    Frame frame = spongecake_frame(theta, s);
+    SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
+    float t = (1.0 - bsdf.base_weight) * bsdf.transmittance(frame.to_local(wi_ws));
+    return ratio(t, detach(t));
+}
+
+/// Whether a surface emits from both sides: two-sided materials do, as at the reference path tracer's emitter hits
+/// (its next-event and emission sampling cover the front side only, so the back side is reached by BSDF sampling).
+bool emits_both_sides(Surface s)
+{
+    return is_set(g_scene.material_system.get_material_data(s.material).header.flags, MaterialFlags::two_sided);
+}
+
+/// Radiance emitted by a surface towards `to_ws` (unnormalized). Emission is front-facing only, except for two-sided
+/// materials (emits_both_sides()). Other materials return `other`, their recorded emitted radiance.
 [Differentiable]
 float3 eval_emission(float theta, no_diff Surface s, float3 normal, float3 to_ws, no_diff float3 other)
 {
-    if (dot(detach(normal), detach(to_ws)) <= 0)
+    if (dot(detach(normal), detach(to_ws)) <= 0 && !emits_both_sides(s))
         return float3(0);
     if (s.kind == MATERIAL_STANDARD)
         return texture_param(theta, s.standard.emissive_texture.data, s.si.uv,

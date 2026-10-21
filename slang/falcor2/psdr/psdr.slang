@@ -13,8 +13,8 @@
 // The module's files: globals.slang (shader parameters), parameters.slang and geometry.slang (differentiable
 // scene access), materials.slang and openpbr.slang (BSDFs), lights.slang, paths.slang (path records and the
 // terms of their vertices), a file per term (interior.slang, also the primal image, pixel_boundary.slang,
-// primary.slang and secondary.slang, with boundary.slang shared by the boundary terms) and queries.slang (scene
-// queries of falcor2.psdr).
+// primary.slang and secondary.slang, with boundary.slang shared by the boundary terms), light_paths.slang (light
+// paths from the analytic lights, part of the interior term) and queries.slang (scene queries of falcor2.psdr).
 
 module psdr;
 
@@ -33,4 +33,5 @@ __include "pixel_boundary.slang";
 __include "boundary.slang";
 __include "primary.slang";
 __include "secondary.slang";
+__include "light_paths.slang";
 __include "queries.slang";
