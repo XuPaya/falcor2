@@ -33,8 +33,8 @@ public void render_primary(uint tid, uint samples)
     uint index = uint(film.y) * camera.dims.x + uint(film.x);
     // The surface behind the edge, or the environment it hides.
     PathRecord rec;
-    trace_path(xb, d, sg, rec);
-    float3 value = path_value(rec);
+    trace_path(xb, d, NO_SLOT, sg, rec);
+    float3 value = rec.radiance;
     if (all(value == 0))
         return;
     Background b = background(rec, xb, d);

@@ -234,7 +234,9 @@ public struct SpongeCakeBSDF : IDifferentiable
     {
         float value = no_diff load(i);
         if (table_derivatives) {
-            [ForceUnroll]
+            // A loop (not unrolled): entry() is inlined at every table lookup.
+            [MaxIters(4)]
+            [loop]
             for (uint p = 0; p < 4; p++)
                 value += table_tangent[p] * no_diff load(first + p * stride);
         }

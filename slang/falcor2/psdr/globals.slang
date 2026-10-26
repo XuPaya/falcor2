@@ -5,7 +5,6 @@ implementing psdr;
 
 // Constants, shader parameters and link-time constants.
 
-static const uint MAX_DEPTH = 8;
 static const uint NO_SLOT = 0xffffffff;
 /// Parameter slots per material. StandardMaterial: base color (0-2), metallic (3), roughness (4),
 /// ior (5), emissive factor (6-8), diffuse transmission (9), specular transmission (10), transmission
@@ -40,15 +39,8 @@ public uint seed;
 public uint standard_type_id;
 public uint openpbr_type_id;
 public uint spongecake_type_id;
-/// Link-time constant: whether the scene has OpenPBR materials. Without them, the differentiable
-/// OpenPBR evaluation, which is expensive to compile, is compiled out.
-public extern static const bool has_openpbr;
-/// Link-time constant: whether the scene has SpongeCake materials (their differentiable evaluation is compiled in
-/// only then).
-public extern static const bool has_spongecake = false;
-/// Link-time constant: whether materials have normal maps. Without them, shading frames are constant, which
-/// keeps the BSDF derivatives much cheaper.
-public extern static const bool normal_maps;
+/// Whether materials have normal maps. Without them, shading frames are detached (constant).
+public bool normal_maps;
 public uint light_slot_base;
 public extern struct LightSampler : ILightSampler = PowerLightSampler;
 public ParameterBlock<LightSampler> light_sampler;
@@ -75,3 +67,10 @@ public RWStructuredBuffer<float3> pixel_boundary;
 public RWByteAddressBuffer primary_boundary;
 public RWStructuredBuffer<float3> secondary_boundary;
 public StructuredBuffer<float3> dl_di;
+
+/// Path records of the kernels that differentiate whole paths: vertex k of the path in record slot i is
+/// path_vertices[k * path_slots + i] (PathVertex, paths.slang), k <= max_bounces, so the buffer has
+/// (max_bounces + 1) x path_slots entries and the path depth is a runtime value. The host dispatches the kernels in
+/// chunks of at most path_slots threads.
+RWStructuredBuffer<PathVertex> path_vertices;
+public uint path_slots;

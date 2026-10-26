@@ -23,6 +23,24 @@ MaterialSystem::MaterialSystem(Scene* scene)
           .label = "MaterialSystem::material_data",
       })
 {
+    init_builtin_type_conformances();
+}
+
+void MaterialSystem::init_builtin_type_conformances()
+{
+    // Built-in material types (no generated modules), in fixed type id order. 0 is InvalidMaterial.
+    static constexpr const char* builtin_types[] = {
+        "InvalidMaterial",
+        "EmissionOnlyMaterial",
+        "OpenPBRMaterial",
+        "SpongeCakeMaterial",
+        "StandardMaterial",
+        "StandardSpecGlossMaterial",
+        "UnlitMaterial",
+    };
+    m_type_conformances.clear();
+    for (int32_t type_id = 0; type_id < int32_t(std::size(builtin_types)); ++type_id)
+        m_type_conformances.push_back(sgl::TypeConformance{"IMaterial", builtin_types[type_id], type_id});
 }
 
 SceneUpdateFlags MaterialSystem::update(SceneUpdateContext& ctx)
@@ -60,8 +78,9 @@ SceneUpdateFlags MaterialSystem::update(SceneUpdateContext& ctx)
             m_requires_opacity_evaluation = true;
     }
 
-    // Build type conformances.
-    // TODO(scene): We should (optionally) only build conformances for materials actually used in the scene.
+    // Build type conformances: the built-in material types always (fixed type ids), so that programs linked
+    // with the scene do not depend on which of them the scene uses, then the generated types (MDL, MaterialX)
+    // of the scene's materials.
     std::set<std::string> slang_type_names;
     for (size_t i = 0; i < m_materials.size(); ++i) {
         Material* material = m_materials[i];
@@ -69,12 +88,13 @@ SceneUpdateFlags MaterialSystem::update(SceneUpdateContext& ctx)
             continue;
         slang_type_names.emplace(material->slang_type_name());
     }
-    m_type_conformances.clear();
-    m_type_conformances.push_back(sgl::TypeConformance{"IMaterial", "InvalidMaterial", 0});
-    slang_type_names.erase("InvalidMaterial");
-    std::unordered_map<std::string, int32_t> slang_type_name_to_type_id = {{"InvalidMaterial", 0}};
-    // Start at 1 since 0 is reserved for InvalidMaterial.
-    int32_t type_id = 1;
+    init_builtin_type_conformances();
+    std::unordered_map<std::string, int32_t> slang_type_name_to_type_id;
+    for (const sgl::TypeConformance& conformance : m_type_conformances) {
+        slang_type_name_to_type_id.emplace(conformance.type_name, conformance.id);
+        slang_type_names.erase(conformance.type_name);
+    }
+    int32_t type_id = int32_t(m_type_conformances.size());
     for (const std::string& slang_type_name : slang_type_names) {
         m_type_conformances.push_back(sgl::TypeConformance{"IMaterial", slang_type_name, type_id});
         slang_type_name_to_type_id.emplace(slang_type_name, type_id);

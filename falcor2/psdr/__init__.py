@@ -21,9 +21,9 @@ terms) and openpbr (the differentiable OpenPBR headers).
 """
 
 from falcor2.psdr.layout import (ENV_MAP_PARAMS, LIGHT_PARAMS, LIGHT_SLOTS, MATERIAL_PARAMS, MATERIAL_SLOTS,
-                                 MATERIAL_TEXTURES, MAX_DEPTH, NO_SLOT, PHOTON_EMISSIONS, TERMS)
+                                 MATERIAL_TEXTURES, NO_SLOT, PHOTON_EMISSIONS, TERMS)
 from falcor2.psdr.openpbr import generate_openpbr_headers
 from falcor2.psdr.renderer import PSDR
 
 __all__ = ["ENV_MAP_PARAMS", "LIGHT_PARAMS", "LIGHT_SLOTS", "MATERIAL_PARAMS", "MATERIAL_SLOTS", "MATERIAL_TEXTURES",
-           "MAX_DEPTH", "NO_SLOT", "PHOTON_EMISSIONS", "PSDR", "TERMS", "generate_openpbr_headers"]
+           "NO_SLOT", "PHOTON_EMISSIONS", "PSDR", "TERMS", "generate_openpbr_headers"]

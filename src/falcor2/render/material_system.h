@@ -40,6 +40,8 @@ public:
     bool requires_opacity_evaluation() const { return m_requires_opacity_evaluation; }
 
 private:
+    /// Reset the type conformances to the built-in material types (fixed type ids).
+    void init_builtin_type_conformances();
     /// Allocate a new material ID.
     shared::MaterialID allocate_material_id();
     /// Free a material ID.

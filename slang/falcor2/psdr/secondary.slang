@@ -268,36 +268,42 @@ float3 segment_gradient(HitRef receiver_hit, SegmentSource source, float3 weight
     return result;
 }
 
-/// Per-vertex detached contributions of a recorded camera path (radiance towards the previous vertex).
-public void render_secondary(uint2 pixel, uint spp_index, uint spp)
+/// Per-vertex detached contributions of a recorded camera path (radiance towards the previous vertex), for pixel
+/// (tid.x, row0 + tid.y) (one dispatch per chunk of rows: at most path_slots pixels, one record slot each).
+public void render_secondary(uint2 tid, uint row0, uint spp_index, uint spp)
 {
+    uint2 pixel = uint2(tid.x, row0 + tid.y);
+    uint slot = tid.y * camera.dims.x + tid.x;
     uint index = pixel.y * camera.dims.x + pixel.x;
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, 0x40000000 | (seed * spp + spp_index));
     PathRecord rec;
-    if (!trace_path(camera.position, camera_dir(float2(pixel) + next_float2(sg)), sg, rec))
+    if (!trace_path(camera.position, camera_dir(float2(pixel) + next_float2(sg)), slot, sg, rec))
         return;
     // Prefix throughput and suffix radiance give the weight of every path through a segment.
-    float3 suffix[MAX_DEPTH + 2];
-    path_terms(rec, suffix);
+    path_terms(rec);
     float3 adjoint = backward ? dl_di[index] / spp : float3(0);
     float3 root = 1;
     float3 result = 0;
     for (uint k = 0; k < rec.length; k++) {
-        LightRecord l = rec.light[k];
-        VertexTerms t = rec.terms[k];
+        const PathVertex pv = path_vertex(rec, k);
+        LightRecord l = pv.light;
+        VertexTerms t = pv.terms;
         if (is_volume_vertex(rec, k)) {
             // Medium scattering vertex: no surface, no edges seen from it.
             root *= t.step;
             continue;
         }
         if (l.kind == LIGHT_TRIANGLE)
-            result += segment_gradient(rec.hit[k], mesh_source(l.hit), root * t.nee, adjoint);
+            result += segment_gradient(pv.hit, mesh_source(l.hit), root * t.nee, adjoint);
         else if (l.kind != LIGHT_NONE)
-            result += segment_gradient(rec.hit[k], light_source(l, load_vertex(0, rec.hit[k]).p), root * t.nee, adjoint);
-        if (k + 1 < rec.length && rec.pdf[k + 1] > 0 && !is_volume_vertex(rec, k + 1))
-            result += segment_gradient(rec.hit[k], mesh_source(rec.hit[k + 1]), root * t.step * suffix[k + 1], adjoint);
-        else if (k + 1 == rec.length && rec.miss_pdf > 0)
-            result += segment_gradient(rec.hit[k], direction_source(rec.miss_dir), root * t.step, adjoint);
+            result += segment_gradient(pv.hit, light_source(l, load_vertex(0, pv.hit).p), root * t.nee, adjoint);
+        if (k + 1 < rec.length) {
+            const PathVertex next = path_vertex(rec, k + 1);
+            if (next.pdf > 0 && (next.flags & VERTEX_VOLUME) == 0)
+                result += segment_gradient(pv.hit, mesh_source(next.hit), root * t.step * pv.tail, adjoint);
+        } else if (k + 1 == rec.length && rec.miss_pdf > 0) {
+            result += segment_gradient(pv.hit, direction_source(rec.miss_dir), root * t.step, adjoint);
+        }
         root *= t.step;
     }
     if (!backward)

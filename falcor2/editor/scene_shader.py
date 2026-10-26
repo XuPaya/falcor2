@@ -7,6 +7,39 @@ import slangpy as spy
 import falcor2 as fc
 
 
+# Light samplers that programs select at run time through SelectableLightSampler (slang/falcor2/render/
+# light_sampler.slang): their kind there. Programs for them are linked once for all of them.
+SELECTABLE_LIGHT_SAMPLERS = {"UniformLightSampler": 0, "PowerLightSampler": 1}
+
+
+def light_sampler_prelude(sampler: fc.LightSampler) -> str:
+    """Prelude exporting the LightSampler type of a program: SelectableLightSampler for the selectable samplers
+    (the same program for each of them), otherwise the sampler's own type and specialization constants."""
+    if sampler.slang_type_name in SELECTABLE_LIGHT_SAMPLERS:
+        return "export struct LightSampler : ILightSampler = SelectableLightSampler;\n"
+    return (sampler.shader_specialization_source
+            + f"export struct LightSampler : ILightSampler = {sampler.slang_type_name};\n")
+
+
+def light_sampler_key(sampler: fc.LightSampler) -> Any:
+    """Cache key of the program specialization light_sampler_prelude() makes for a sampler."""
+    if sampler.slang_type_name in SELECTABLE_LIGHT_SAMPLERS:
+        return "SelectableLightSampler"
+    return (sampler.slang_type_name, sampler.shader_generation)
+
+
+def bind_light_sampler(cursor, sampler: fc.LightSampler):
+    """Binds a light sampler to a program's light_sampler (see light_sampler_prelude())."""
+    kind = SELECTABLE_LIGHT_SAMPLERS.get(sampler.slang_type_name)
+    if kind is None:
+        cursor["light_sampler"] = sampler
+        return
+    block = cursor["light_sampler"]
+    block["kind"] = kind
+    if sampler.slang_type_name == "PowerLightSampler":
+        block["power"] = sampler
+
+
 class SceneShaderHelper:
     """Load and cache a slang module linked with a scene's render module and requirements."""
 

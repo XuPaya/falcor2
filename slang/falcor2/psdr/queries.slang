@@ -56,7 +56,7 @@ public uint3 material_texture(uint material, uint role, uint standard_id, uint o
         default: return texture_info(m.transmission_texture.data, m.transmission_texture.is_udim());
         }
     }
-    if (has_openpbr && data.header.type_id == openpbr_id)
+    if (data.header.type_id == openpbr_id)
         return openpbr_texture(reinterpret<OpenPBRMaterial>(data), role);
     return uint3(NO_SLOT, 0, 0);
 }

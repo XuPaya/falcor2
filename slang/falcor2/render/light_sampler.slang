@@ -640,3 +640,70 @@ public struct HierarchicalLightSampler : ILightSampler
         return 0.0;
     }
 }
+
+/// UniformLightSampler (kind 0) or PowerLightSampler (kind 1), chosen at run time: programs linked with it serve
+/// both samplers, so switching between them compiles nothing (see falcor2.editor.scene_shader.bind_light_sampler()).
+public struct SelectableLightSampler : ILightSampler
+{
+    public static const uint UNIFORM = 0;
+    public static const uint POWER = 1;
+
+    public uint kind;
+    public PowerLightSampler power;
+
+    public bool sample<SampleGenerator : ISampleGenerator>(
+        const LightSampleContext ctx,
+        inout SampleGenerator sg,
+        out LightSample sample
+    )
+    {
+        if (kind == POWER)
+            return power.sample(ctx, sg, sample);
+        return UniformLightSampler().sample(ctx, sg, sample);
+    }
+
+    public float eval_environment_pdf(const LightSampleContext ctx, const float3 dir_ws)
+    {
+        if (kind == POWER)
+            return power.eval_environment_pdf(ctx, dir_ws);
+        return UniformLightSampler().eval_environment_pdf(ctx, dir_ws);
+    }
+
+    public float eval_emissive_pdf(
+        const LightSampleContext ctx,
+        const EmissiveTriangleID triangle_id,
+        const float3 emitter_pos_ws,
+        const float3 emitter_normal_ws
+    )
+    {
+        if (kind == POWER)
+            return power.eval_emissive_pdf(ctx, triangle_id, emitter_pos_ws, emitter_normal_ws);
+        return UniformLightSampler().eval_emissive_pdf(ctx, triangle_id, emitter_pos_ws, emitter_normal_ws);
+    }
+
+    public float eval_analytic_pdf(
+        const LightSampleContext ctx,
+        const uint light_index,
+        const float3 emitter_pos_ws,
+        const float3 emitter_normal_ws
+    )
+    {
+        if (kind == POWER)
+            return power.eval_analytic_pdf(ctx, light_index, emitter_pos_ws, emitter_normal_ws);
+        return UniformLightSampler().eval_analytic_pdf(ctx, light_index, emitter_pos_ws, emitter_normal_ws);
+    }
+
+    public bool sample_emitter(const float u, out EmitterType type, out uint index, out float pmf)
+    {
+        if (kind == POWER)
+            return power.sample_emitter(u, type, index, pmf);
+        return UniformLightSampler().sample_emitter(u, type, index, pmf);
+    }
+
+    public float eval_emitter_pmf(const EmitterType type, const uint index)
+    {
+        if (kind == POWER)
+            return power.eval_emitter_pmf(type, index);
+        return UniformLightSampler().eval_emitter_pmf(type, index);
+    }
+}

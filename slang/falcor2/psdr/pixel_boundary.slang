@@ -31,9 +31,9 @@ float3 pixel_sample(uint2 pixel, float u, float3 adjoint, inout UniformSampleGen
     float3 d = camera_dir(float2(pixel) + offset);
     PathRecord rec;
     // The environment does not move with the scene: no boundary term.
-    if (!trace_path(camera.position, d, sg, rec))
+    if (!trace_path(camera.position, d, NO_SLOT, sg, rec))
         return 0;
-    float3 value = path_value(rec);
+    float3 value = rec.radiance;
     float3 xb = camera.position + d / dot(d, camera_forward());
     Background b = background(rec, xb, d);
     float3 nb = cross(edge_dir, d);

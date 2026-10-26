@@ -10,10 +10,10 @@ import numpy as np
 import slangpy as spy
 
 import falcor2 as f2
-from falcor2.editor.scene_shader import SceneShaderHelper
+from falcor2.editor.scene_shader import SceneShaderHelper, bind_light_sampler, light_sampler_prelude
 from falcor2.psdr.edges import classify_edges, edge_topology, normalize_cdf
 from falcor2.psdr.layout import (ENV_MAP_PARAMS, ENVIRONMENT_LIGHTS, LIGHT_PARAMS, LIGHT_SLOTS, MATERIAL_PARAMS,
-                                 MATERIAL_SLOTS, MATERIAL_TEXTURES, MAX_DEPTH, NO_SLOT, PHOTON_EMISSIONS, TERMS,
+                                 MATERIAL_SLOTS, MATERIAL_TEXTURES, NO_SLOT, PHOTON_EMISSIONS, TERMS,
                                  light_emission)
 from falcor2.psdr.openpbr import generate_openpbr_headers
 
@@ -26,6 +26,21 @@ LIGHT_TRACING_KEYS = {"light_tracing", "light_derivatives", "light_contribution_
 FRAMES_PER_SEED = 65536
 # Samples per pixel per dispatch of the per-pixel derivative kernels (long dispatches hit the GPU timeout).
 SAMPLES_PER_DISPATCH = 32
+# Path records (path_vertices / light_path_vertices, globals.slang / light_paths.slang): one record of max_bounces + 1
+# camera-path vertices (PATH_VERTEX_SIZE bytes each) or max_bounces light-path vertices per record slot; the slots fill at
+# most this memory each, and the kernels that record paths are dispatched in chunks of at most that many threads.
+PATH_RECORD_BYTES = 256 << 20
+PATH_VERTEX_SIZE = 220
+LIGHT_PATH_VERTEX_SIZE = 84
+# Backward interior term: memory of the vertex work items (VertexItem, interior.slang: VERTEX_ITEM_SIZE bytes each).
+VERTEX_ITEM_BYTES = 256 << 20
+VERTEX_ITEM_SIZE = 284
+# compile_kernels(): (kernel, backward) from the largest program to the smallest.
+COMPILE_ORDER = [("render_light_frames", True), ("render_interior", True), ("render_light", True),
+                 ("backward_vertices", True), ("render_light", False), ("render_interior", False),
+                 ("render_secondary", True), ("render_secondary", False), ("render_pixel_boundary", True),
+                 ("render_pixel_boundary", False), ("render_primary", True), ("render_primary", False),
+                 ("record_interior", True), ("render_primal", False), ("sample_photons", False)]
 
 
 class PSDR:
@@ -76,8 +91,8 @@ class PSDR:
         photon_count: int = PHOTON_EMISSIONS,
         rr_depth: Optional[int] = 3,
     ):
-        if not 0 <= max_bounces <= MAX_DEPTH:
-            raise ValueError(f"max_bounces must be in [0, {MAX_DEPTH}]")
+        if max_bounces < 0:
+            raise ValueError("max_bounces must be non-negative")
         scene.update()
         self.device, self.scene, self.max_bounces = device, scene, max_bounces
         self.width, self.height = camera.width, camera.height
@@ -88,19 +103,16 @@ class PSDR:
         conformances = scene.requirements.type_conformances
         type_ids = {c.type_name: c.id for c in conformances if c.interface_name == "IMaterial"}
         self._light_sampler = light_sampler or f2.PowerLightSampler()
-        prelude = (self._light_sampler.shader_specialization_source
-                   + f"export struct LightSampler : ILightSampler = {self._light_sampler.slang_type_name};\n")
-        has_openpbr = "OpenPBRMaterial" in type_ids
-        has_spongecake = "SpongeCakeMaterial" in type_ids
+        # The kernels depend on the scene only through run-time values (the scene's materials are always all
+        # built-in material types; the light sampler a run-time choice), so other scenes reuse their programs.
+        prelude = light_sampler_prelude(self._light_sampler)
 
         def query(name, backward=False):
-            constants = {"has_openpbr": has_openpbr, "has_spongecake": has_spongecake, "normal_maps": self._normal_maps,
-                         "backward": backward}
-            function = getattr(module, name).constants(constants).prelude(prelude).type_conformances(conformances)
-            return function.write(self._helper.bind_scene)
+            function = getattr(module, name).constants({"backward": backward}).prelude(prelude)
+            return function.type_conformances(conformances).write(self._helper.bind_scene)
 
         self._query = query
-        self._normal_maps = False
+        self.normal_map_derivatives = None  # backward()'s argument while it runs
 
         # Geometry instances, their vertex ranges and materials.
         self.instances = {}
@@ -191,7 +203,13 @@ class PSDR:
             "light_derivatives": False,
         }
         self._light_tracing = None
-        # Kernels by (name, backward), compiled on first use.
+        # Debugging: read the vertex item count after each record_interior() dispatch (vertex_item_stats).
+        self.check_vertex_items = False
+        # Backward mode: the interior term in two kernels (record_interior + backward_vertices, ~3x faster; False:
+        # render_interior, as forward mode) and the frames' light paths in merged dispatches.
+        self.split_interior = True
+        self.merge_light_frames = True
+        # Kernels by (name, backward), compiled on first use (or by compile_kernels()).
         self._kernels = {}
         self.photon_count = photon_count
         self._upload_scene_state()
@@ -415,17 +433,25 @@ class PSDR:
         return images
 
     def backward(self, dl_di: np.ndarray, spp: int = 1, seed: int = 0, terms=TERMS, antithetic=True,
-                 accumulate: bool = False):
+                 accumulate: bool = False, normal_map_derivatives: Optional[bool] = None):
         """Gradients (vertex (V, 3), params (P,)) of L given dL/dI (H, W, 3); ``antithetic`` as in forward().
 
         ``accumulate``: the pass's gradients stay on the GPU, added to those of the previous accumulate passes, and
         backward() returns None; gradients() reads the sum (e.g. once per multi-view iteration, instead of reading
-        param_count floats back per view)."""
+        param_count floats back per view).
+
+        ``normal_map_derivatives``: False differentiates with constant shading frames, i.e. without the gradients of
+        normal map texels and normal_texture_scale (zero); None (default) or True: with them whenever the scene has
+        normal maps. (A run-time switch of the same kernels.)"""
         if self._grads_pending and not accumulate:
             raise RuntimeError("Accumulated gradients unread: call gradients() first")
         dl_di = np.ascontiguousarray(dl_di, np.float32).reshape(-1, 3)
         self._buffers["dl_di"].copy_from_numpy(dl_di)
-        self._run(True, spp, seed, terms, antithetic, clear_gradients=not self._grads_pending)
+        self.normal_map_derivatives = normal_map_derivatives
+        try:
+            self._run(True, spp, seed, terms, antithetic, clear_gradients=not self._grads_pending)
+        finally:
+            self.normal_map_derivatives = None
         if accumulate:
             self._grads_pending = True
             return None
@@ -470,6 +496,16 @@ class PSDR:
                 raise ValueError("At most 2^24 light paths per frame")
         # Frame by frame, as the forward renderer: the frame's light paths (splats into light_primal; their derivatives
         # into light_interior or the gradients), then the camera paths, accumulated into the primal image.
+        if light and backward and count > 0 and self.merge_light_frames:
+            # The frames' light paths in few dispatches (their gradients add up in any order).
+            frames = max(1, (1 << 24) // count)
+            slots = self._light_path_buffers(count * min(frames, spp))
+            for i in range(0, spp, frames):
+                n = min(frames, spp - i)
+                for tid0 in range(0, count * n, slots):
+                    self._call("render_light_frames", True, seed, tid=spy.grid((min(slots, count * n - tid0),)),
+                               tid0=tid0, count=count, frames=n, frame0=(seed * FRAMES_PER_SEED + i) & 0xFFFFFFFF)
+            light = False
         for i in range(spp):
             frame = (seed * FRAMES_PER_SEED + i) & 0xFFFFFFFF
             if light:
@@ -478,13 +514,21 @@ class PSDR:
                     encoder.clear_buffer(self._buffers["light_primal"])
                     self.device.submit_command_buffer(encoder.finish())
                 if count > 0:
-                    self._call("render_light", backward, seed, tid=spy.grid((count,)), count=count, frame=frame)
+                    slots = self._light_path_buffers(count)
+                    for tid0 in range(0, count, slots):
+                        self._call("render_light", backward, seed, tid=spy.grid((min(slots, count - tid0),)), tid0=tid0,
+                                   count=count, frame=frame)
             if not backward:
                 self._call("render_primal", False, seed, pixel=pixels, frame=frame, sample_index=i)
-        if "interior" in terms:
+        if "interior" in terms and backward and self.split_interior:
+            self._backward_interior(spp, seed, paths)
+        elif "interior" in terms:
+            rows = self._path_rows()
             for first in range(0, spp, SAMPLES_PER_DISPATCH):
-                self._call("render_interior", backward, seed, pixel=pixels, spp=spp, first=first,
-                           count=min(SAMPLES_PER_DISPATCH, spp - first), antithetic=paths)
+                for row0 in range(0, self.height, rows):
+                    self._call("render_interior", backward, seed, tid=spy.grid((min(rows, self.height - row0), self.width)),
+                               row0=row0, spp=spp, first=first, count=min(SAMPLES_PER_DISPATCH, spp - first),
+                               antithetic=paths)
         if "pixel" in terms:
             for first in range(0, spp, SAMPLES_PER_DISPATCH):
                 self._call("render_pixel_boundary", backward, seed, pixel=pixels, spp=spp, first=first,
@@ -499,13 +543,139 @@ class PSDR:
             for i in range(spp):
                 self._call("sample_photons", False, seed * spp + i, tid=spy.grid((self.photon_count,)))
                 self._build_photon_bvh()
-                self._call("render_secondary", backward, seed, pixel=pixels, spp_index=i, spp=spp)
+                rows = self._path_rows()
+                for row0 in range(0, self.height, rows):
+                    self._call("render_secondary", backward, seed, tid=spy.grid((min(rows, self.height - row0), self.width)),
+                               row0=row0, spp_index=i, spp=spp)
 
-    def _call(self, name: str, backward: bool, seed: int, **kwargs):
+    def compile_kernels(self, light_tracing: bool = True, max_parallel: int = 4, names=None):
+        """Builds every kernel of forward() and backward() (with light_tracing, also the light term's; as selected by
+        split_interior and merge_light_frames) in one command list. On a device created with pipeline_compilation_mode=parallel their programs then compile concurrently,
+        instead of one after another as the passes first use them; programs in the device's shader cache load from it.
+        The kernels do not depend on the scene (see __init__), so this compiles once per shader cache.
+
+        Each kernel runs on one thread (the dispatch that makes the device compile it), mostly with no work to do;
+        the output and gradient buffers are cleared afterwards. ``max_parallel``: kernels per command list (each
+        compiling kernel can take several GB of memory). ``names``: only these kernels."""
+        if self._grads_pending:
+            raise RuntimeError("Accumulated gradients unread: call gradients() first")
+        pixel, thread = spy.grid((1, 1)), spy.grid((1,))
+        split, merged = self.split_interior, self.merge_light_frames
+        kernels = [
+            ("render_primal", (False,), dict(pixel=pixel, frame=0, sample_index=0)),
+            ("render_interior", (False,) if split else (False, True),
+             dict(tid=pixel, row0=0, spp=1, first=0, count=0, antithetic=True)),
+            ("render_pixel_boundary", (False, True), dict(pixel=pixel, spp=1, first=0, count=0, antithetic=4)),
+            ("render_primary", (False, True), dict(tid=thread, samples=1)),
+            ("sample_photons", (False,), dict(tid=thread)),
+            ("render_secondary", (False, True), dict(tid=pixel, row0=0, spp_index=0, spp=1)),
+        ]
+        if split:
+            kernels.append(("record_interior", (True,), dict(tid=pixel, spp=1, first=0, row0=0, rows=1, antithetic=True)))
+            kernels.append(("backward_vertices", (True,), dict(tid=thread)))
+        if light_tracing:
+            kernels.append(("render_light", (False,) if merged else (False, True),
+                            dict(tid=thread, tid0=0, count=0, frame=0)))
+            if merged:
+                kernels.append(("render_light_frames", (True,), dict(tid=thread, tid0=0, count=0, frames=1, frame0=0)))
+        self._vertex_item_buffers()
+        self._path_rows()
+        self._light_path_buffers(1)
+        self._build_photon_bvh()
+        # No primary edge samples; photon sampling reads the (padded) first edge of the edge buffer.
+        overrides = {"primary_edge_count": 0, "photon_edge_count": max(1, len(getattr(self, "_photon", ())))}
+        outputs = ["primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
+                   "light_interior", "vertex_grad", "param_grad", "vertex_item_count"]
+        dispatches = [(name, backward, kwargs) for name, modes, kwargs in kernels for backward in modes
+                      if names is None or name in names]
+        # Largest programs first (a command list compiles as long as its slowest program; their sizes in inlined HLSL
+        # lines order them, ~0.1-0.9 M).
+        dispatches.sort(key=lambda d: COMPILE_ORDER.index((d[0], d[1])) if (d[0], d[1]) in COMPILE_ORDER else 99)
+        for first in range(0, len(dispatches), max(1, max_parallel)):
+            encoder = self.device.create_command_encoder()
+            encoder.clear_buffer(self._buffers["vertex_item_count"])
+            for name, backward, kwargs in dispatches[first:first + max(1, max_parallel)]:
+                self._kernel(name, backward).write(self._binder(0, overrides)).append_to(encoder, **kwargs)
+            self.device.submit_command_buffer(encoder.finish())
+        encoder = self.device.create_command_encoder()
+        for name in outputs:
+            encoder.clear_buffer(self._buffers[name])
+        self.device.submit_command_buffer(encoder.finish())
+
+    def _backward_interior(self, spp: int, seed: int, antithetic: bool):
+        """The backward interior term in two kernels per chunk of samples and rows: record_interior() writes the camera
+        paths' surface vertices as work items, backward_vertices() differentiates one per thread. Chunks are sized so
+        that their items fit the item buffer even if every path has the maximum length."""
+        capacity = self._vertex_item_buffers()
+        per_row = self.width * 2 * (self.max_bounces + 1)  # items of a row of pixel samples at most
+        # One record slot per thread (pixel sample).
+        rows = max(1, min(self.height, capacity // per_row, self._path_rows()))
+        samples = (max(1, min(capacity // (per_row * self.height), self._globals["path_slots"] // (self.width * self.height)))
+                   if rows == self.height else 1)
+        self.vertex_item_stats = []
+        for first in range(0, spp, samples):
+            count = min(samples, spp - first)
+            for row0 in range(0, self.height, rows):
+                n = min(rows, self.height - row0)
+                encoder = self.device.create_command_encoder()
+                encoder.clear_buffer(self._buffers["vertex_item_count"])
+                self.device.submit_command_buffer(encoder.finish())
+                self._call("record_interior", True, seed, tid=spy.grid((count * n, self.width)), spp=spp, first=first,
+                           row0=row0, rows=n, antithetic=antithetic)
+                if self.check_vertex_items:
+                    written = int(self._buffers["vertex_item_count"].to_numpy().view(np.uint32)[0])
+                    self.vertex_item_stats.append((count * n * self.width, written))
+                    if written > capacity:
+                        raise RuntimeError(f"vertex item buffer overflow: {written} > {capacity}")
+                self._call("backward_vertices", True, seed, tid=spy.grid((min(capacity, count * n * per_row),)))
+
+    def _path_rows(self) -> int:
+        """Rows of pixels per dispatch of the kernels that record camera paths, one record slot per pixel sample: the
+        camera-path records (path_vertices; allocated on first use, at most PATH_RECORD_BYTES) hold all pixels of the
+        image or as many rows as fit."""
+        if "path_vertices" not in self._buffers:
+            record = (self.max_bounces + 1) * PATH_VERTEX_SIZE
+            rows = max(1, min(self.height, PATH_RECORD_BYTES // (record * self.width)))
+            slots = rows * self.width
+            self._buffers["path_vertices"] = self.device.create_buffer(
+                size=slots * record, struct_size=PATH_VERTEX_SIZE,
+                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
+            self._globals["path_slots"] = slots
+        return max(1, self._globals["path_slots"] // self.width)
+
+    def _light_path_buffers(self, threads: int) -> int:
+        """Record slots of the light paths (light_path_vertices) for dispatches of up to `threads` light paths (at most
+        PATH_RECORD_BYTES); returns the threads per dispatch."""
+        record = max(1, self.max_bounces) * LIGHT_PATH_VERTEX_SIZE
+        slots = max(1, min(threads, PATH_RECORD_BYTES // record))
+        if self._globals.get("light_path_slots", 0) < slots:
+            self._buffers["light_path_vertices"] = self.device.create_buffer(
+                size=slots * record, struct_size=LIGHT_PATH_VERTEX_SIZE,
+                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
+            self._globals["light_path_slots"] = slots
+        return self._globals["light_path_slots"]
+
+    def _vertex_item_buffers(self) -> int:
+        """The vertex work items of the split backward interior term (allocated on first use); returns their capacity."""
+        if "vertex_items" not in self._buffers:
+            capacity = max(1, VERTEX_ITEM_BYTES // VERTEX_ITEM_SIZE)
+            self._buffers["vertex_items"] = self.device.create_buffer(
+                size=capacity * VERTEX_ITEM_SIZE, struct_size=VERTEX_ITEM_SIZE,
+                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
+            self._buffers["vertex_item_count"] = self._buffer(np.zeros(4, np.uint32))
+            self._globals["vertex_item_capacity"] = capacity
+        return self._globals["vertex_item_capacity"]
+
+    def _kernel(self, name: str, backward: bool):
+        if (name, backward) not in self._kernels:
+            self._kernels[name, backward] = self._query(name, backward)
+        return self._kernels[name, backward]
+
+    def _binder(self, seed: int, overrides: Optional[dict] = None):
         def bind(cursor):
             cursor["camera"] = self.camera
             cursor["seed"] = seed
-            cursor["light_sampler"] = self._light_sampler
+            bind_light_sampler(cursor, self._light_sampler)
             # The light-tracing state is bound only with light tracing on (older shader modules lack it).
             light = self._light_tracing is not None
             for key, value in self._globals.items():
@@ -516,10 +686,18 @@ class PSDR:
                     cursor[key] = value
             if self._photon_accel is not None:
                 cursor["photon_tlas"] = self._photon_accel[2]
+            cursor["normal_maps"] = self._normal_map_kernels()
+            for key, value in (overrides or {}).items():
+                cursor[key] = value
 
-        if (name, backward) not in self._kernels:
-            self._kernels[name, backward] = self._query(name, backward)
-        self._kernels[name, backward].write(bind)(**kwargs)
+        return bind
+
+    def _call(self, name: str, backward: bool, seed: int, **kwargs):
+        self._kernel(name, backward).write(self._binder(seed))(**kwargs)
+
+    def _normal_map_kernels(self) -> bool:
+        """Whether the kernels differentiate shading frames through normal maps (see normal_map_derivatives)."""
+        return self._normal_maps and self.normal_map_derivatives is not False
 
     def _image(self, name: str) -> np.ndarray:
         return self._buffers[name].to_numpy().view(np.float32).reshape(self.height, self.width, 3).copy()

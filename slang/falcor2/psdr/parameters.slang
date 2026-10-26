@@ -40,6 +40,30 @@ void bwd_param(inout DifferentialPair<float> theta, float value, uint slot, floa
     theta = diffPair(theta.p, 0.0);
 }
 
+/// Four consecutive parameters (a texel's channels) through one call site.
+[Differentiable, ForwardDerivative(fwd_param4), BackwardDerivative(bwd_param4)]
+float4 param4(float theta, no_diff float4 value, no_diff uint slot)
+{
+    return value;
+}
+
+DifferentialPair<float4> fwd_param4(DifferentialPair<float> theta, float4 value, uint slot)
+{
+    float4 d = float4(0.0);
+    [ForceUnroll]
+    for (uint c = 0; c < 4; c++)
+        d[c] = theta.d * param_tangent[slot + c];
+    return diffPair(value, d);
+}
+
+void bwd_param4(inout DifferentialPair<float> theta, float4 value, uint slot, float4 d)
+{
+    [loop]
+    for (uint c = 0; c < 4; c++)
+        atomic_add(param_grad, 4 * (slot + c), d[c]);
+    theta = diffPair(theta.p, 0.0);
+}
+
 [Differentiable]
 float3 param3(float theta, no_diff float3 value, no_diff uint slot)
 {
@@ -79,14 +103,15 @@ float4 texel_bilinear(float theta, no_diff RawTextureHandle h, float2 uv, no_dif
     int2 i = int2(floor(detach(p)));
     float2 f = p - float2(i);
     float4 result = float4(0.0);
-    [ForceUnroll]
+    // A loop (not unrolled) with one parameter call site: this function is inlined at every textured attribute.
+    [MaxIters(4)]
+    [loop]
     for (uint k = 0; k < 4; k++) {
         int2 t = ((i + int2(k & 1, k >> 1)) % size + size) % size;
         float4 value = no_diff h.load(t);
         uint slot = layout.x + 4 * uint(t.y * size.x + t.x);
         float weight = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);
-        result += weight * float4(param(theta, value.x, slot), param(theta, value.y, slot + 1),
-                                  param(theta, value.z, slot + 2), param(theta, value.w, slot + 3));
+        result += weight * param4(theta, value, slot);
     }
     // The sampler's value (its bilinear weights have limited subtexel precision, which matters for the normals
     // of sharp lobes) and the exact derivative.

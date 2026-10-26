@@ -7,7 +7,6 @@ import numpy as np
 
 import falcor2 as f2
 
-MAX_DEPTH = 8
 MATERIAL_SLOTS = 52
 LIGHT_SLOTS = 6
 PHOTON_EMISSIONS = 8192  # default PSDR photon_count

@@ -153,6 +153,24 @@ def test_psdr_primal_matches_path_tracer(device_type: spy.DeviceType, fp: str, v
 
 
 @pytest.mark.parametrize("device_type", DEVICE_TYPES)
+@pytest.mark.parametrize("max_depth", [16, 32])
+def test_psdr_primal_matches_path_tracer_deep(device_type: spy.DeviceType, max_depth: int):
+    """Deep paths (indoor depths; PSDR compiles its path records for the depth): no Russian roulette, so every path
+    reaches max_depth in the closed room."""
+    device = helpers.get_device(device_type, floating_point_mode=FP_MODES["precise"])
+    spp, seed = 4, 7
+    scene, camera = parity_scene(device, "plain")
+    node = path_tracer(device, camera, max_depth, f2.PowerLightSampler())
+    node.rr_depth = 1000
+    forward = forward_image(device, scene, camera, node, spp, seed)
+    other = forward_image(device, scene, camera, node, spp, seed + 1)
+    psdr = PSDR(device, scene, camera, max_bounces=max_depth - 1, light_sampler=f2.PowerLightSampler(), rr_depth=None)
+    primal = psdr.forward(spp=spp, seed=seed, terms=(), antithetic=False)["primal"]
+    compare(forward, primal, other, f"precise/deep {max_depth}")
+    assert np.array_equal(forward, primal)
+
+
+@pytest.mark.parametrize("device_type", DEVICE_TYPES)
 @pytest.mark.parametrize("fp", ["precise", "default"])
 def test_psdr_primal_matches_adjoint_tracer(device_type: spy.DeviceType, fp: str):
     """Light tracing: the sun through a SpongeCake sheer (delta + scattered transmission) and a room's lights."""

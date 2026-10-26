@@ -51,8 +51,11 @@ create_settings_module(sgl::Device* device, UVOrigin uv_origin, bool requires_op
     std::string source = "import falcor2.render;\n";
     source += is_lower_left ? "export static const bool FALCOR_TEXTURE_COORDINATE_ORIGIN_LOWER_LEFT = true;\n"
                             : "export static const bool FALCOR_TEXTURE_COORDINATE_ORIGIN_LOWER_LEFT = false;\n";
-    source += "export struct OpacityEvaluator : IOpacityEvaluator = ";
-    source += requires_opacity_evaluation ? "MaterialOpacityEvaluator;\n" : "AcceptAllHitsEvaluator;\n";
+    // The material opacity evaluator whether or not the scene has alpha-tested materials, so that programs linked
+    // with the scene do not depend on it: without them, every instance is opaque in the acceleration structures
+    // (RenderScene::update()) and rays never evaluate opacity.
+    FALCOR_UNUSED(requires_opacity_evaluation);
+    source += "export struct OpacityEvaluator : IOpacityEvaluator = MaterialOpacityEvaluator;\n";
 
     std::string module_name = "falcor2_scene_settings_" + sgl::SHA1(source).hex_digest();
     return device->load_module_from_source(module_name, source);

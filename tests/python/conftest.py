@@ -73,14 +73,14 @@ def pytest_addoption(parser: pytest.Parser):
     parser.addoption(
         "--module-cache",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable the persistent module cache for test devices",
+        default=True,
+        help="Persistent module cache for test devices (default on; --no-module-cache for a cold run)",
     )
     parser.addoption(
         "--shader-cache",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable the persistent shader cache for test devices",
+        default=True,
+        help="Persistent shader cache for test devices (default on; --no-shader-cache for a cold run)",
     )
     parser.addoption(
         "--module-and-shader-cache-dir",

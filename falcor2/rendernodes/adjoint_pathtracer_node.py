@@ -32,7 +32,8 @@ import slangpy as spy
 from slangpy import CommandEncoder, Device
 
 import falcor2 as f2
-from falcor2.editor.scene_shader import SceneShaderHelper
+from falcor2.editor.scene_shader import (SceneShaderHelper, bind_light_sampler, light_sampler_key,
+                                         light_sampler_prelude)
 from falcor2.rendergraph import Container, ContainerSpec, RenderNode
 from falcor2.rendernodes.reference_pathtracer_node import ReferencePathTracerNode
 
@@ -203,12 +204,10 @@ class AdjointPathTracerNode(RenderNode):
             "ENABLE_RUSSIAN_ROULETTE": self._enable_russian_roulette,
         }
         sampler = pt.light_sampler
-        key = (module, tuple(sorted(constants.items())), sampler.slang_type_name, sampler.shader_generation)
+        key = (module, tuple(sorted(constants.items())), light_sampler_key(sampler))
         if key != self._funcs_key:
             conformances = scene.requirements.type_conformances
-            prelude = sampler.shader_specialization_source + (
-                f"export struct LightSampler : ILightSampler = {sampler.slang_type_name};\n"
-            )
+            prelude = light_sampler_prelude(sampler)
             self._funcs = {
                 name: getattr(module, name)
                 .constants(constants)
@@ -300,7 +299,7 @@ class AdjointPathTracerNode(RenderNode):
             sampler.update(scene, cmd)      # the path tracer updates it otherwise
 
         def bind(cursor: Any) -> None:
-            cursor["light_sampler"] = sampler
+            bind_light_sampler(cursor, sampler)
             block = cursor["g_light_tracer"]
             for name, value in settings.items():
                 block["settings"][name] = value

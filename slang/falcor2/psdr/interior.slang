@@ -14,11 +14,11 @@ public RWStructuredBuffer<float3> primal_sum;
 public RWStructuredBuffer<float3> primal_residual;
 
 /// Camera path of pixel sample i (the same paths in all kernels: the reference path tracer's path of frame
-/// seed * FRAMES_PER_SEED + i); `antithetic` and `dual` as in trace_path().
-void trace_camera_path(uint2 pixel, uint i, uint spp, bool antithetic, bool dual, out PathRecord rec)
+/// seed * FRAMES_PER_SEED + i), recorded into `slot`; `antithetic` and `dual` as in trace_path().
+void trace_camera_path(uint2 pixel, uint i, uint spp, bool antithetic, bool dual, uint slot, out PathRecord rec)
 {
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, seed * FRAMES_PER_SEED + i);
-    trace_path(primary_ray(pixel, sg), sg, rec, antithetic, dual);
+    trace_path(primary_ray(pixel, sg), slot, sg, rec, antithetic, dual);
 }
 
 float neumaier_correction(float sum, float value, float next)
@@ -44,7 +44,7 @@ public void render_primal(uint2 pixel, uint frame, uint sample_index)
     uint index = pixel.y * camera.dims.x + pixel.x;
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frame);
     PathRecord rec;
-    trace_path(primary_ray(pixel, sg), sg, rec);
+    trace_path(primary_ray(pixel, sg), NO_SLOT, sg, rec);
     float3 value = rec.radiance;
     if (light_tracing)
         value = value + asfloat(light_primal.Load3(index * 12));
@@ -66,9 +66,12 @@ public void render_primal(uint2 pixel, uint frame, uint sample_index)
     primal[index] = (next + residual) * inverse_count;
 }
 
-/// Samples first, ..., first + count - 1 of spp (one dispatch per chunk of samples: long dispatches time out).
-public void render_interior(uint2 pixel, uint spp, uint first, uint count, bool antithetic)
+/// Samples first, ..., first + count - 1 of spp (one dispatch per chunk of samples: long dispatches time out) of pixel
+/// (tid.x, row0 + tid.y) (one dispatch per chunk of rows: at most path_slots pixels, one record slot each).
+public void render_interior(uint2 tid, uint row0, uint spp, uint first, uint count, bool antithetic)
 {
+    uint2 pixel = uint2(tid.x, row0 + tid.y);
+    uint slot = tid.y * camera.dims.x + tid.x;
     uint index = pixel.y * camera.dims.x + pixel.x;
     float3 adjoint = backward ? dl_di[index] / spp : float3(0);
     float3 derivative = 0;
@@ -76,7 +79,7 @@ public void render_interior(uint2 pixel, uint spp, uint first, uint count, bool 
         [loop]
         for (uint branch = 0; branch < 2; branch++) {
             PathRecord rec;
-            trace_camera_path(pixel, i, spp, antithetic, branch == 1, rec);
+            trace_camera_path(pixel, i, spp, antithetic, branch == 1, slot, rec);
             float weight = rec.antithetic ? 0.5 : 1.0;
             float3 d;
             differentiate_path(rec, true, adjoint * weight, d);
@@ -89,4 +92,89 @@ public void render_interior(uint2 pixel, uint spp, uint first, uint count, bool 
     }
     if (!backward)
         interior[index] += derivative / spp;
+}
+
+// Split backward interior term: record_interior() traces the camera paths and writes one work item per surface vertex
+// (the vertex's record and the adjoints of its terms); backward_vertices() differentiates one vertex per thread. The
+// derivative code then runs in a kernel without the tracer and the path record, in short uniform threads.
+
+/// A vertex of a camera path with the adjoints of its terms (VertexTerms.Differential: emission and nee share theirs).
+struct VertexItem
+{
+    VertexRecord v;
+    float3 d_terms;
+    float3 d_step;
+    float limit;
+};
+
+RWStructuredBuffer<VertexItem> vertex_items;
+/// Items written (uint at offset 0; may exceed the capacity, see vertex_item_capacity).
+public RWByteAddressBuffer vertex_item_count;
+public uint vertex_item_capacity;
+
+void append_vertex_item(VertexItem item)
+{
+    // One atomic per wave: the active lanes' items are consecutive.
+    uint count = WaveActiveCountBits(true);
+    uint base = 0;
+    if (WaveIsFirstLane())
+        vertex_item_count.InterlockedAdd(0, count, base);
+    uint index = WaveReadLaneFirst(base) + WavePrefixCountBits(true);
+    if (index < vertex_item_capacity)
+        vertex_items[index] = item;
+}
+
+/// Backward mode: records the vertices of path sample first + tid.y / rows of pixel (tid.x, row0 + tid.y % rows) (one
+/// record slot per thread: at most path_slots threads per dispatch).
+public void record_interior(uint2 tid, uint spp, uint first, uint row0, uint rows, bool antithetic)
+{
+    uint slot = tid.y * camera.dims.x + tid.x;
+    uint2 pixel = uint2(tid.x, row0 + tid.y % rows);
+    uint i = first + tid.y / rows;
+    uint index = pixel.y * camera.dims.x + pixel.x;
+    float3 adjoint = dl_di[index] / spp;
+    [loop]
+    for (uint branch = 0; branch < 2; branch++) {
+        PathRecord rec;
+        trace_camera_path(pixel, i, spp, antithetic, branch == 1, slot, rec);
+        float3 weight = adjoint * (rec.antithetic ? 0.5 : 1.0);
+        float3 value = path_terms(rec);
+        if (rec.length == 0 && any(rec.miss_scale > 0)) {
+            // The camera sees the environment map.
+            var theta = diffPair(0.0);
+            bwd_diff(env_map_radiance)(theta, rec.miss_dir, weight);
+        }
+        float limit = max_relative_vertex_derivative > 0
+            ? max(max_relative_vertex_derivative * length(weight * value), 1e-30) : 0.0;
+        float3 prefix = 1;
+        for (uint k = 0; k < rec.length; k++) {
+            const PathVertex pv = path_vertex(rec, k);
+            VertexItem item;
+            item.d_terms = weight * prefix;
+            item.d_step = weight * prefix * pv.tail;
+            if ((pv.flags & VERTEX_VOLUME) == 0 && (any(item.d_terms != 0) || any(item.d_step != 0))) {
+                item.v = vertex_record(rec, k);
+                item.limit = limit;
+                append_vertex_item(item);
+            }
+            prefix *= pv.terms.step;
+        }
+        if (!rec.antithetic)
+            break;
+    }
+}
+
+/// Backward mode: the interior-term gradients of recorded vertex tid.
+public void backward_vertices(uint tid)
+{
+    if (tid >= min(vertex_item_count.Load(0), vertex_item_capacity))
+        return;
+    VertexItem item = vertex_items[tid];
+    vertex_derivative_limit = item.limit;
+    VertexTerms.Differential d;
+    d.emission = item.d_terms;
+    d.nee = item.d_terms;
+    d.step = item.d_step;
+    var theta = diffPair(0.0);
+    bwd_diff(vertex_terms)(theta, item.v, true, d);
 }

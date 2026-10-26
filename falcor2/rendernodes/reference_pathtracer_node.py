@@ -19,7 +19,8 @@ from falcor2.rendergraph import (
     OutputPrelude,
 )
 
-from falcor2.editor.scene_shader import SceneShaderHelper
+from falcor2.editor.scene_shader import (SceneShaderHelper, bind_light_sampler, light_sampler_key,
+                                         light_sampler_prelude)
 
 REFERENCE_MODULE_PATH = "falcor2/rendernodes/reference_pathtracer.slang"
 WRITE_GUIDE_INTERFACE = "IWriteGuide"
@@ -431,8 +432,7 @@ class ReferencePathTracerNode(RenderNode):
         render_func_constants = (
             constants,
             self._prelude.signature(write_guide),
-            self._light_sampler.slang_type_name,
-            self._light_sampler.shader_generation,
+            light_sampler_key(self._light_sampler),
         )
         if self._render_func is None or self._render_func_constants != render_func_constants:
             assert self._scene
@@ -441,16 +441,16 @@ class ReferencePathTracerNode(RenderNode):
             scatter_ray_desc.name = "scatter"
             scatter_ray_desc.has_miss = True
             scatter_ray_desc.has_closest_hit = True
-            scatter_ray_desc.has_any_hit = self._scene.requirements.requires_opacity_evaluation
+            # Any-hit shaders whether or not the scene has alpha-tested materials, so that the program does not
+            # depend on the scene: without them every instance is opaque and they never run.
+            scatter_ray_desc.has_any_hit = True
             ray_descs = [scatter_ray_desc]
 
             if self._visibility_ray_mode == VisibilityRayMode.trace_ray:
                 visibility_ray_desc = f2.SceneRayTracingSetup.RayDesc()
                 visibility_ray_desc.name = "visibility"
                 visibility_ray_desc.has_miss = True
-                visibility_ray_desc.has_any_hit = (
-                    self._scene.requirements.requires_opacity_evaluation
-                )
+                visibility_ray_desc.has_any_hit = True
                 ray_descs.append(visibility_ray_desc)
 
             rt_setup = f2.SceneRayTracingSetup.create(
@@ -460,12 +460,7 @@ class ReferencePathTracerNode(RenderNode):
 
             # Generate a prelude that selects the light sampler and implements
             # IWriteGuide for the requested guide targets.
-            prelude = ""
-            prelude += self._light_sampler.shader_specialization_source
-            prelude += (
-                "export struct LightSampler : ILightSampler = "
-                f"{self._light_sampler.slang_type_name};\n"
-            )
+            prelude = light_sampler_prelude(self._light_sampler)
             prelude += self._prelude.generate(write_guide)
             render_func = module.render.constants(constants).prelude(prelude)
 
@@ -613,7 +608,7 @@ class ReferencePathTracerNode(RenderNode):
         # function, because the target containers are frame-local and can change.
         def bind_dispatch(cursor: Any) -> None:
             self._prelude.bind(cursor, write_guide)
-            cursor["light_sampler"] = self._light_sampler
+            bind_light_sampler(cursor, self._light_sampler)
             path_tracer_settings = cursor["g_path_tracer"]["settings"]
             for name, value in self._settings.items():
                 path_tracer_settings[name] = value

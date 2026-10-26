@@ -39,10 +39,10 @@ Surface make_surface(HitRef h, float3 wi_ws, float exterior_ior = 1.0)
         s.kind = MATERIAL_STANDARD;
         s.standard = reinterpret<StandardMaterial>(data);
         s.standard_instance = s.standard.setup_material_instance(s.si, ExplicitLodSampler(), SHADING_HINTS);
-    } else if (has_openpbr && data.header.type_id == openpbr_type_id) {
+    } else if (data.header.type_id == openpbr_type_id) {
         s.kind = MATERIAL_OPENPBR;
         s.openpbr = reinterpret<OpenPBRMaterial>(data);
-    } else if (has_spongecake && data.header.type_id == spongecake_type_id) {
+    } else if (data.header.type_id == spongecake_type_id) {
         s.kind = MATERIAL_SPONGECAKE;
         s.spongecake = reinterpret<SpongeCakeMaterial>(data);
     }
@@ -191,17 +191,24 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
             f1 = bsdf.eval(wi_ls, wo_ls1, sg, BSDFContext());
         if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls2, wo2))
             f2 = bsdf.eval(wi_ls, wo_ls2, sg, BSDFContext());
-    } else if (has_openpbr && s.kind == MATERIAL_OPENPBR) {
+    } else if (s.kind == MATERIAL_OPENPBR) {
         eval_openpbr(theta, s, wi_ws, wo1, wo2, f1, f2);
-    } else if (has_spongecake && s.kind == MATERIAL_SPONGECAKE) {
+    } else if (s.kind == MATERIAL_SPONGECAKE) {
         Frame frame = spongecake_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
         SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
         Frame primal = detach(frame);
-        if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls1, wo1))
-            f1 = bsdf.eval(wi_ls, wo_ls1);
-        if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls2, wo2))
-            f2 = bsdf.eval(wi_ls, wo_ls2);
+        // Both directions through one call site (the evaluation's derivative code is instantiated once).
+        float3 f[2] = { float3(0), float3(0) };
+        [MaxIters(2)]
+        [loop]
+        for (uint d = 0; d < 2; d++) {
+            float3 wo = d == 0 ? wo1 : wo2, wo_ls = d == 0 ? wo_ls1 : wo_ls2;
+            if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls, wo))
+                f[d] = bsdf.eval(wi_ls, wo_ls);
+        }
+        f1 = f[0];
+        f2 = f[1];
     } else {
         f1 = other1;
         f2 = other2;
@@ -214,7 +221,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 [Differentiable]
 float delta_scale(float theta, no_diff Surface s, float3 wi_ws)
 {
-    if (!(has_spongecake && s.kind == MATERIAL_SPONGECAKE))
+    if (s.kind != MATERIAL_SPONGECAKE)
         return 1.0;
     Frame frame = spongecake_frame(theta, s);
     SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
@@ -240,7 +247,7 @@ float3 eval_emission(float theta, no_diff Surface s, float3 normal, float3 to_ws
         return texture_param(theta, s.standard.emissive_texture.data, s.si.uv,
                              s.standard.emissive_texture.sample(ExplicitLodSampler(), s.si.uv, float4(1.0))).rgb
             * param3(theta, s.standard.emissive_factor, s.slot + 6);
-    if (has_openpbr && s.kind == MATERIAL_OPENPBR)
+    if (s.kind == MATERIAL_OPENPBR)
         return openpbr_emission(theta, s);
     return other;
 }

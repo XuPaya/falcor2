@@ -61,9 +61,9 @@ Background background(PathRecord rec, float3 origin, float3 dir)
 {
     Background b = {};
     b.is_hit = rec.length > 0;
-    b.hit = rec.hit[0];
+    b.hit = rec.first_hit;
     if (b.is_hit) {
-        Vertex v = load_vertex(0, rec.hit[0]);
+        Vertex v = load_vertex(0, rec.first_hit);
         b.p = v.p;
         b.n = v.n;
     } else {

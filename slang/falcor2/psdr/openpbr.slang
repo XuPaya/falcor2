@@ -603,46 +603,65 @@ struct OpenPBRLuts
     DescriptorHandle<SamplerState> sampler;
 };
 
-float4 openpbr_texel(const OpenPBR_LutId lut_id, int3 p)
+/// The table texture of a 2D (or 1D) LUT. The table is chosen once per lookup and its texels are loaded through
+/// that one descriptor: a per-texel choice among all tables made every inlined lookup eight table switches.
+DescriptorHandle<Texture2D> openpbr_table_2d(const OpenPBR_LutId lut_id)
 {
     OpenPBRLuts luts = reinterpret<OpenPBRLuts>(openpbr_globals);
     switch (lut_id) {
-    case OpenPBR_LutId_IdealDielectricEnergyComplement:
-        return luts.ideal_dielectric_energy_complement.Load(int4(p, 0));
     case OpenPBR_LutId_IdealDielectricAverageEnergyComplement:
-        return luts.ideal_dielectric_average_energy_complement.Load(int3(p.xy, 0));
+        return luts.ideal_dielectric_average_energy_complement;
     case OpenPBR_LutId_IdealDielectricReflectionRatio:
-        return luts.ideal_dielectric_reflection_ratio.Load(int3(p.xy, 0));
-    case OpenPBR_LutId_OpaqueDielectricEnergyComplement:
-        return luts.opaque_dielectric_energy_complement.Load(int4(p, 0));
+        return luts.ideal_dielectric_reflection_ratio;
     case OpenPBR_LutId_OpaqueDielectricAverageEnergyComplement:
-        return luts.opaque_dielectric_average_energy_complement.Load(int3(p.xy, 0));
+        return luts.opaque_dielectric_average_energy_complement;
     case OpenPBR_LutId_IdealMetalEnergyComplement:
-        return luts.ideal_metal_energy_complement.Load(int3(p.xy, 0));
+        return luts.ideal_metal_energy_complement;
     case OpenPBR_LutId_IdealMetalAverageEnergyComplement:
-        return luts.ideal_metal_average_energy_complement.Load(int3(p.xy, 0));
-    case OpenPBR_LutId_LTC:
-        return luts.ltc.Load(int3(p.xy, 0));
+        return luts.ideal_metal_average_energy_complement;
+    default:
+        return luts.ltc;
     }
-    return float4(0);
 }
 
-/// Linear interpolation of the table texels around continuous texel coordinate p (the lookup of a sampler
+/// The table texture of a 3D LUT.
+DescriptorHandle<Texture3D> openpbr_table_3d(const OpenPBR_LutId lut_id)
+{
+    OpenPBRLuts luts = reinterpret<OpenPBRLuts>(openpbr_globals);
+    if (lut_id == OpenPBR_LutId_OpaqueDielectricEnergyComplement)
+        return luts.opaque_dielectric_energy_complement;
+    return luts.ideal_dielectric_energy_complement;
+}
+
+float4 openpbr_texel_2d(DescriptorHandle<Texture2D> t, int2 p) { return t.Load(int3(p, 0)); }
+float4 openpbr_texel_3d(DescriptorHandle<Texture3D> t, int3 p) { return t.Load(int4(p, 0)); }
+
+/// Linear interpolation of a table's texels around continuous texel coordinate p (the lookup of a sampler
 /// with linear filtering and clamping), differentiable with respect to p.
 [Differentiable]
-float4 openpbr_lut_interpolate(no_diff OpenPBR_LutId lut_id, float3 p, no_diff uint3 size)
+float4 openpbr_lut_bilinear(no_diff DescriptorHandle<Texture2D> t, float2 p, no_diff uint2 size)
+{
+    p = clamp(p, float2(0.0), float2(size - 1));
+    int2 i = int2(detach(p));
+    int2 j = min(i + 1, int2(size) - 1);
+    float2 f = p - float2(i);
+    float4 v00 = no_diff openpbr_texel_2d(t, i), v10 = no_diff openpbr_texel_2d(t, int2(j.x, i.y));
+    float4 v01 = no_diff openpbr_texel_2d(t, int2(i.x, j.y)), v11 = no_diff openpbr_texel_2d(t, j);
+    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+}
+
+[Differentiable]
+float4 openpbr_lut_trilinear(no_diff DescriptorHandle<Texture3D> t, float3 p, no_diff uint3 size)
 {
     p = clamp(p, float3(0.0), float3(size - 1));
     int3 i = int3(detach(p));
     int3 j = min(i + 1, int3(size) - 1);
     float3 f = p - float3(i);
-    float4 v000 = no_diff openpbr_texel(lut_id, i), v100 = no_diff openpbr_texel(lut_id, int3(j.x, i.y, i.z));
-    float4 v010 = no_diff openpbr_texel(lut_id, int3(i.x, j.y, i.z)), v110 = no_diff openpbr_texel(lut_id, int3(j.x, j.y, i.z));
+    float4 v000 = no_diff openpbr_texel_3d(t, i), v100 = no_diff openpbr_texel_3d(t, int3(j.x, i.y, i.z));
+    float4 v010 = no_diff openpbr_texel_3d(t, int3(i.x, j.y, i.z)), v110 = no_diff openpbr_texel_3d(t, int3(j.x, j.y, i.z));
     float4 v0 = lerp(lerp(v000, v100, f.x), lerp(v010, v110, f.x), f.y);
-    if (size.z == 1)
-        return v0;
-    float4 v001 = no_diff openpbr_texel(lut_id, int3(i.x, i.y, j.z)), v101 = no_diff openpbr_texel(lut_id, int3(j.x, i.y, j.z));
-    float4 v011 = no_diff openpbr_texel(lut_id, int3(i.x, j.y, j.z)), v111 = no_diff openpbr_texel(lut_id, int3(j.x, j.y, j.z));
+    float4 v001 = no_diff openpbr_texel_3d(t, int3(i.x, i.y, j.z)), v101 = no_diff openpbr_texel_3d(t, int3(j.x, i.y, j.z));
+    float4 v011 = no_diff openpbr_texel_3d(t, int3(i.x, j.y, j.z)), v111 = no_diff openpbr_texel_3d(t, int3(j.x, j.y, j.z));
     return lerp(v0, lerp(lerp(v001, v101, f.x), lerp(v011, v111, f.x), f.y), f.z);
 }
 
@@ -654,15 +673,16 @@ float4 openpbr_lut_2d(no_diff OpenPBR_LutId lut_id, float2 uv)
 {
     // As created by OpenPBRMaterial: the ideal metal average energy table is one-dimensional (one row).
     uint height = lut_id == OpenPBR_LutId_IdealMetalAverageEnergyComplement ? 1 : OpenPBR_EnergyTableSize;
-    uint3 size = lut_id == OpenPBR_LutId_LTC ? uint3(OpenPBR_LTCTableSize, OpenPBR_LTCTableSize, 1)
-                                             : uint3(OpenPBR_EnergyTableSize, height, 1);
-    return openpbr_lut_interpolate(lut_id, float3(uv * float2(size.xy) - 0.5, 0.0), size);
+    uint2 size = lut_id == OpenPBR_LutId_LTC ? uint2(OpenPBR_LTCTableSize, OpenPBR_LTCTableSize)
+                                             : uint2(OpenPBR_EnergyTableSize, height);
+    return openpbr_lut_bilinear(no_diff openpbr_table_2d(lut_id), uv * float2(size) - 0.5, size);
 }
 
 [Differentiable]
 float4 openpbr_lut_3d(no_diff OpenPBR_LutId lut_id, float3 uv)
 {
-    return openpbr_lut_interpolate(lut_id, uv * float(OpenPBR_EnergyTableSize) - 0.5, uint3(OpenPBR_EnergyTableSize));
+    return openpbr_lut_trilinear(no_diff openpbr_table_3d(lut_id), uv * float(OpenPBR_EnergyTableSize) - 0.5,
+                                 uint3(OpenPBR_EnergyTableSize));
 }
 
 /// Layout of OpenPBRMaterial.Attributes, whose fields are internal to the render module.
@@ -821,16 +841,19 @@ void eval_openpbr(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, floa
     OpenPBR_ResolvedInputs inputs = openpbr_inputs(theta, s);
     OpenPBR_PreparedBsdf bsdf
         = openpbr_prepare(inputs, float3(1.0), OpenPBR_BaseRgbWavelengths_nm, s.si.exterior_ior, wi_ws);
-    f1 = float3(0);
-    f2 = float3(0);
-    if (any(detach(wo1) != 0)) {
-        OpenPBR_DiffuseSpecular value = openpbr_eval(bsdf, wo1);
-        f1 = value.diffuse + value.specular;
+    // Both directions through one call site, so the evaluation's derivative code is instantiated once.
+    float3 f[2] = { float3(0), float3(0) };
+    [MaxIters(2)]
+    [loop]
+    for (uint d = 0; d < 2; d++) {
+        float3 wo = d == 0 ? wo1 : wo2;
+        if (any(detach(wo) != 0)) {
+            OpenPBR_DiffuseSpecular value = openpbr_eval(bsdf, wo);
+            f[d] = value.diffuse + value.specular;
+        }
     }
-    if (any(detach(wo2) != 0)) {
-        OpenPBR_DiffuseSpecular value = openpbr_eval(bsdf, wo2);
-        f2 = value.diffuse + value.specular;
-    }
+    f1 = f[0];
+    f2 = f[1];
 }
 
 [Differentiable]

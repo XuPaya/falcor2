@@ -28,33 +28,46 @@ struct VertexTerms : IDifferentiable
 /// Vertex flags: a homogeneous-medium scattering vertex (no surface, no derivatives).
 static const uint VERTEX_VOLUME = 1;
 
-/// Detached path: vertex hits, sampling pdfs and MIS weights recorded by the primal tracer.
+/// Vertex k of a recorded path (path_vertices, globals.slang): its hit, sampling pdfs and MIS weights recorded by the
+/// primal tracer.
+struct PathVertex
+{
+    HitRef hit;
+    /// VERTEX_VOLUME, else a surface vertex.
+    uint flags;
+    /// World position (volume vertices have no hit).
+    float3 position;
+    /// Exterior IOR of the surface interaction (interior tracking).
+    float exterior_ior;
+    /// Solid-angle pdf of the direction that generated the vertex (k > 0), or zero for delta lobes.
+    float pdf;
+    /// Sample weight (BSDF value over pdf) of the direction that generated the vertex, or of the last sampled direction
+    /// (k = length) when it escapes.
+    float3 delta_weight;
+    /// Detached factors of the throughput from vertex k to vertex k + 1 besides the sample weight: Russian roulette
+    /// (1 / survival) and the medium weight of the segment.
+    float3 step_scale;
+    /// MIS weight of the emission found at the vertex.
+    float mis;
+    /// Emitted radiance at the vertex for other materials (see eval_bsdf).
+    float3 emission;
+    LightRecord light;
+    /// Primal vertex terms from the material system's values, so that path values need no evaluation.
+    VertexTerms terms;
+    /// The radiance that vertices k + 1, k + 2, ... send towards vertex k, relative to the throughput reaching vertex
+    /// k + 1 (one at the last vertex); written by path_terms().
+    float3 tail;
+};
+
+/// Detached path: its vertices (in path_vertices) and its end.
 struct PathRecord
 {
+    /// Record slot in path_vertices, or NO_SLOT: the vertices are not recorded (only the path's radiance is wanted).
+    uint slot;
     uint length;
     float3 origin;
-    HitRef hit[MAX_DEPTH + 1];
-    /// VERTEX_VOLUME, else a surface vertex.
-    uint flags[MAX_DEPTH + 1];
-    /// World position of each vertex (volume vertices have no hit).
-    float3 position[MAX_DEPTH + 1];
-    /// Exterior IOR of the surface interaction (interior tracking).
-    float exterior_ior[MAX_DEPTH + 1];
-    /// Solid-angle pdf of the direction that generated vertex i (i > 0), or zero for delta lobes.
-    float pdf[MAX_DEPTH + 1];
-    /// Sample weight (BSDF value over pdf) of the direction that generated hit[i], or of the last
-    /// sampled direction (i = length) when it escapes.
-    float3 delta_weight[MAX_DEPTH + 1];
-    /// Detached factors of the throughput from vertex i to vertex i + 1 besides the sample weight: Russian roulette
-    /// (1 / survival) and the medium weight of the segment.
-    float3 step_scale[MAX_DEPTH + 1];
-    /// MIS weight of the emission found at hit[i].
-    float mis[MAX_DEPTH + 1];
-    /// Emitted radiance at hit[i] for other materials (see eval_bsdf).
-    float3 emission[MAX_DEPTH + 1];
-    LightRecord light[MAX_DEPTH + 1];
-    /// Primal vertex terms from the material system's values, so that path values need no evaluation.
-    VertexTerms terms[MAX_DEPTH + 1];
+    /// The first vertex's hit (also without a record).
+    HitRef first_hit;
     /// Environment radiance (MIS-weighted) seen by the last sampled direction, and its factor (MIS and delta
     /// lobe weight) on the environment radiance.
     float3 miss_radiance;
@@ -68,7 +81,9 @@ struct PathRecord
     bool antithetic;
 };
 
-bool is_volume_vertex(PathRecord rec, uint k) { return (rec.flags[k] & VERTEX_VOLUME) != 0; }
+uint path_index(PathRecord rec, uint k) { return k * path_slots + rec.slot; }
+PathVertex path_vertex(PathRecord rec, uint k) { return path_vertices[path_index(rec, k)]; }
+bool is_volume_vertex(PathRecord rec, uint k) { return (path_vertices[path_index(rec, k)].flags & VERTEX_VOLUME) != 0; }
 
 /// Antithetic BSDF samples: the second number of a sample is turned by half a turn (u -> u + 0.5 mod 1), which keeps
 /// the samples' distribution. StandardMaterial and OpenPBRMaterial choose the lobe with the first number and the
@@ -78,16 +93,18 @@ struct AntitheticSampleGenerator : ISampleGenerator
 {
     UniformSampleGenerator sg;
     uint count;
+    /// Without flip, the numbers of sg unchanged (so that one sampling call site serves both kinds of sample).
+    bool flip;
 
-    __init(uint seed) { sg = UniformSampleGenerator(seed); count = 0; }
-    __init(uint2 pixel, uint sample_index) { sg = UniformSampleGenerator(pixel, sample_index); count = 0; }
-    __init(UniformSampleGenerator s) { sg = s; count = 0; }
+    __init(uint seed) { sg = UniformSampleGenerator(seed); count = 0; flip = true; }
+    __init(uint2 pixel, uint sample_index) { sg = UniformSampleGenerator(pixel, sample_index); count = 0; flip = true; }
+    __init(UniformSampleGenerator s, bool flip = true) { sg = s; count = 0; this.flip = flip; }
 
     [mutating]
     uint next_uint()
     {
         uint u = sg.next_uint();
-        return count++ == 1 ? u + 0x80000000u : u;
+        return flip && count++ == 1 ? u + 0x80000000u : u;
     }
 };
 
@@ -270,10 +287,12 @@ float light_tracer_reverse_pdf(TriangleHitInfo hit, MaterialID material_id, Surf
     return light_mi.eval_with_pdf(light_si, si.wi_ws, eval_sg).pdf;
 }
 
-/// p_t1 / p_s1 of a next-event sample (the reference path tracer's light_tracer_nee_ratio()).
-float light_tracer_nee_ratio(TriangleHitInfo hit, MaterialID material_id, SurfaceInteraction si, LightSample ls,
-                             bool unreachable, float lt_ratio, uint depth)
+/// p_t1 / p_s1 of a next-event sample (the reference path tracer's light_tracer_nee_ratio()) is
+/// lt_ratio * light_tracer_reverse_pdf(..., ls.dir_ws, depth) * this ratio when `reachable`, otherwise 0.
+float light_tracer_nee_ratio(SurfaceInteraction si, LightSample ls, bool unreachable, float lt_ratio,
+                             out bool reachable)
 {
+    reachable = false;
     if (!light_tracing || unreachable || !(lt_ratio > 0.0))
         return 0.0;
     const float cos_here = abs(dot(si.normal_ws, ls.dir_ws));
@@ -294,7 +313,8 @@ float light_tracer_nee_ratio(TriangleHitInfo hit, MaterialID material_id, Surfac
             return 0.0;
         ratio = pe * cos_here / d2 / light_area_pdf;
     }
-    return lt_ratio * light_tracer_reverse_pdf(hit, material_id, si, ls.dir_ws, depth) * ratio;
+    reachable = true;
+    return ratio;
 }
 
 /// The light sample as a LightRecord (differentiable next-event terms, see light_radiance()).
@@ -334,29 +354,50 @@ bool visible_dir(float3 pos, float3 dir)
 }
 
 /// Multiplies the medium weight of the segment that reached vertex k into the throughput terms of vertex k - 1.
-void scale_segment(inout PathRecord rec, uint k, float3 factor)
+void scale_segment(PathRecord rec, uint k, float3 factor)
 {
-    if (k == 0)
+    if (k == 0 || rec.slot == NO_SLOT)
         return;
-    rec.step_scale[k - 1] *= factor;
-    rec.terms[k - 1].step *= factor;
+    uint i = path_index(rec, k - 1);
+    path_vertices[i].step_scale *= factor;
+    path_vertices[i].terms.step *= factor;
+}
+
+/// Initialises recorded vertex k as it is created (zero, step_scale one) but for its pdf and delta_weight, which the
+/// previous vertex's sample wrote, and clears those of vertex k + 1.
+void init_vertex(PathRecord rec, uint k)
+{
+    if (rec.slot == NO_SLOT)
+        return;
+    uint i = path_index(rec, k);
+    PathVertex v = {};
+    v.step_scale = float3(1.0);
+    v.pdf = path_vertices[i].pdf;
+    v.delta_weight = path_vertices[i].delta_weight;
+    path_vertices[i] = v;
+    if (k < max_bounces) {
+        path_vertices[i + path_slots].pdf = 0.0;
+        path_vertices[i + path_slots].delta_weight = float3(0.0);
+    }
 }
 
 /// Traces and records a camera path from `ray0` (the reference path tracer's path from that ray; the first segment is
-/// a camera ray).
+/// a camera ray) into record slot `slot` of path_vertices (NO_SLOT: no record, the path's radiance only).
 ///
 /// With `antithetic`, the BSDF of the first vertex is sampled twice, with sg and with an AntitheticSampleGenerator,
 /// and `dual` selects the antithetic sample. The two samples choose the same lobe; rec.antithetic tells whether it is
 /// a glossy reflection, for which the two paths (which share all other random numbers) are averaged. The choice is
 /// the same for both paths, which keeps the average unbiased. Returns whether the camera ray hit a surface.
-bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, bool antithetic = false, bool dual = false)
+bool trace_path(Ray ray0, uint slot, inout UniformSampleGenerator sg, out PathRecord rec, bool antithetic = false,
+                bool dual = false)
 {
     rec = {};
+    rec.slot = slot;
     rec.origin = ray0.origin;
-    [ForceUnroll]
-    for (uint i = 0; i <= MAX_DEPTH; i++)
-        rec.step_scale[i] = float3(1.0);
+    const bool record = slot != NO_SLOT;
     const uint max_depth = max_bounces + 1;
+    // Sample weight of the last sampled direction (the record's delta_weight[depth]).
+    float3 last_weight = float3(0.0);
 
     // Path state (the reference path tracer's PathState).
     float3 throughput = float3(1.0);
@@ -404,9 +445,13 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
                 scatter_normal = float3(0.0);
                 depth += 1;
                 uint kv = depth - 1;
+                const uint iv = path_index(rec, kv);
                 rec.length = depth;
-                rec.flags[kv] = VERTEX_VOLUME;
-                rec.position[kv] = ray_origin;
+                init_vertex(rec, kv);
+                if (record) {
+                    path_vertices[iv].flags = VERTEX_VOLUME;
+                    path_vertices[iv].position = ray_origin;
+                }
                 scale_segment(rec, kv, event_weight);
                 if (!any(throughput > 0.0) || depth >= max_depth)
                     break;
@@ -417,15 +462,21 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
                 throughput *= ps.weight;
                 scatter_pdf = ps.pdf;
                 ray_dir = ps.wo_ws;
-                rec.terms[kv].step = ps.weight;
-                rec.delta_weight[kv + 1] = ps.weight;
+                last_weight = ps.weight;
+                if (record) {
+                    path_vertices[iv].terms.step = ps.weight;
+                    path_vertices[iv + path_slots].delta_weight = ps.weight;
+                }
                 float rr;
                 if (!any(throughput > 0.0) || !russian_roulette(depth, throughput, sg, rr)) {
-                    rec.terms[kv].step = float3(0.0);
+                    if (record)
+                        path_vertices[iv].terms.step = float3(0.0);
                     break;
                 }
-                rec.step_scale[kv] = float3(rr);
-                rec.terms[kv].step *= rr;
+                if (record) {
+                    path_vertices[iv].step_scale = float3(rr);
+                    path_vertices[iv].terms.step *= rr;
+                }
                 continue;
             }
             // handle_miss()
@@ -462,13 +513,14 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
                     rec.miss_scale = float3(1.0);
                     rec.miss_radiance = e;
                 } else {
-                    rec.miss_scale = mis * (delta ? rec.delta_weight[k] : float3(1.0));
+                    rec.miss_scale = mis * (delta ? last_weight : float3(1.0));
                     rec.miss_radiance = e * rec.miss_scale;
                     rec.miss_pdf = delta ? 0.0 : scatter_pdf;
-                    rec.terms[k - 1].step *= e * mis;
+                    if (record)
+                        path_vertices[path_index(rec, k - 1)].terms.step *= e * mis;
                 }
-            } else if (!primary_miss) {
-                rec.terms[k - 1].step = float3(0.0);
+            } else if (!primary_miss && record) {
+                path_vertices[path_index(rec, k - 1)].terms.step = float3(0.0);
             }
             break;
         }
@@ -490,8 +542,8 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
         const MaterialHeader header = g_scene.material_system.get_material_data(material_id).header;
         // Back faces of one-sided materials terminate the path.
         if (!(si.front_facing || is_set(header.flags, MaterialFlags::two_sided))) {
-            if (depth > 0)
-                rec.terms[depth - 1].step = float3(0.0);
+            if (depth > 0 && record)
+                path_vertices[path_index(rec, depth - 1)].terms.step = float3(0.0);
             break;
         }
         si.exterior_ior = interiors.exterior_ior(material_id, si.front_facing);
@@ -502,13 +554,21 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
         depth += 1;
         const bool is_primary_hit = depth == 1;
         const uint k = depth - 1;
+        const uint ik = path_index(rec, k);
         hit_surface = true;
         rec.length = depth;
-        rec.hit[k].gid = hit.geometry_instance_id;
-        rec.hit[k].prim = hit.primitive_index;
-        rec.hit[k].bary = hit.barycentrics;
-        rec.position[k] = si.position_ws;
-        rec.exterior_ior[k] = si.exterior_ior;
+        HitRef hit_ref;
+        hit_ref.gid = hit.geometry_instance_id;
+        hit_ref.prim = hit.primitive_index;
+        hit_ref.bary = hit.barycentrics;
+        if (k == 0)
+            rec.first_hit = hit_ref;
+        init_vertex(rec, k);
+        if (record) {
+            path_vertices[ik].hit = hit_ref;
+            path_vertices[ik].position = si.position_ws;
+            path_vertices[ik].exterior_ior = si.exterior_ior;
+        }
 
         if (light_tracing) {
             // Area measure at this vertex: the camera's density of the primary hit, or the cosine of the arrival.
@@ -532,9 +592,11 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
         if (is_unlit) {
             const float3 le = mi.eval_emissive_radiance();
             radiance += throughput * le;
-            rec.emission[k] = le;
-            rec.mis[k] = 1.0;
-            rec.terms[k].emission = le;
+            if (record) {
+                path_vertices[ik].emission = le;
+                path_vertices[ik].mis = 1.0;
+                path_vertices[ik].terms.emission = le;
+            }
             break;
         }
 
@@ -559,15 +621,24 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
             }
             const float3 le = mi.eval_emissive_radiance();
             radiance += throughput * le * mis;
-            rec.emission[k] = le;
-            rec.mis[k] = mis;
-            rec.terms[k].emission = le * mis;
+            if (record) {
+                path_vertices[ik].emission = le;
+                path_vertices[ik].mis = mis;
+                path_vertices[ik].terms.emission = le * mis;
+            }
         }
 
         if (depth >= max_depth)
             break;
 
-        // Next-event estimation (sample_direct_lighting()).
+        // Next-event estimation (sample_direct_lighting()). Its light-tracing MIS weight needs the light tracer's
+        // reverse density: the material evaluations of a vertex (next-event value, reverse densities) share one call site
+        // after the BSDF sample (the evaluations draw no random numbers).
+        bool nee = false;
+        LightSample nee_ls = {};
+        float3 nee_f = float3(0.0);
+        float nee_bsdf_pdf = 0.0, nee_lt_ratio = 0.0;
+        bool nee_reachable = false;
         sampled_hemispheres = material_nee_hemispheres(mi.get_lobe_types(si))
             & nee_visibility_hemispheres(si.front_facing, material_id, is_thin_walled, interiors);
         if (sampled_hemispheres != 0) {
@@ -577,39 +648,36 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
                 && in_sampled_hemispheres(si.front_facing ? si.normal_ws : -si.normal_ws, sampled_hemispheres, ls.dir_ws)) {
                 OpacityEvaluator shadow_opacity = OpacityEvaluator(sg.next_uint());
                 if (!occluded_opacity(light_visibility_ray(si, ls), shadow_opacity)) {
-                    float mis = 1.0;
-                    float3 f;
-                    if (!ls.nee_only) {
-                        const BSDFEval be = mi.eval_with_pdf(si, ls.dir_ws, sg);
-                        f = be.value;
-                        if (light_tracing) {
-                            float ratio = be.pdf / ls.pdf
-                                + light_tracer_nee_ratio(hit, material_id, si, ls, lt_unreachable, lt_ratio, depth);
-                            mis = 1.0 / (1.0 + ratio);
-                        } else {
-                            mis = mis_heuristic(1, ls.pdf, 1, be.pdf);
-                        }
-                    } else {
-                        f = mi.eval(si, ls.dir_ws, sg);
-                        if (light_tracing)
-                            mis = 1.0 / (1.0 + light_tracer_nee_ratio(hit, material_id, si, ls, lt_unreachable, lt_ratio,
-                                                                     depth));
-                    }
-                    radiance += throughput * f * ls.weight * mis;
-                    rec.light[k] = light_record(ls, mis, f);
-                    rec.terms[k].nee = f * ls.weight * mis;
+                    nee = true;
+                    nee_ls = ls;
+                    if (light_tracing)
+                        nee_lt_ratio = light_tracer_nee_ratio(si, ls, lt_unreachable, lt_ratio, nee_reachable);
                 }
             }
         }
 
         // BSDF sample.
-        MaterialSample ms = {};
-        bool sampled;
+        // The sample and, at an antithetic first vertex, its antithetic partner (sampled from a copy of sg) share one
+        // call site: the material sampling it dispatches is inlined at each.
+        MaterialSample ms = {}, other = {};
+        bool sampled = false, other_sampled = false;
+        UniformSampleGenerator other_sg = sg;
+        [loop]
+        for (uint j = 0; j < (k == 0 && antithetic ? 2 : 1); j++) {
+            AntitheticSampleGenerator gen = AntitheticSampleGenerator(j == 0 ? sg : other_sg, j == 1);
+            MaterialSample s = {};
+            bool ok = mi.sample(si, gen, s);
+            if (j == 0) {
+                ms = s;
+                sampled = ok;
+                sg = gen.sg;
+            } else {
+                other = s;
+                other_sampled = ok;
+                other_sg = gen.sg;
+            }
+        }
         if (k == 0 && antithetic) {
-            AntitheticSampleGenerator other_sg = AntitheticSampleGenerator(sg);
-            MaterialSample other = {};
-            bool other_sampled = mi.sample(si, other_sg, other);
-            sampled = mi.sample(si, sg, ms);
             MaterialSample lobe = sampled ? ms : other, other_lobe = other_sampled ? other : ms;
             // Symmetric in the two samples, so that the pair stays unbiased also when the sampled direction (not only
             // the lobe) decides between reflection and transmission (SpongeCakeMaterial's single scattering).
@@ -618,10 +686,57 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
             if (dual) {
                 ms = other;
                 sampled = other_sampled;
-                sg = other_sg.sg;
+                sg = other_sg;
             }
-        } else {
-            sampled = mi.sample(si, sg, ms);
+        }
+        // The vertex's material evaluations through one call site (the evaluation it dispatches is inlined at each): the
+        // next-event value and density (e = 0), then the light tracer's reverse densities (light_tracer_reverse_pdf()) of
+        // the next-event direction (e = 1) and of the sampled direction (e = 2). eval_with_pdf()'s value is eval()'s.
+        const bool bsdf_reverse = light_tracing && sampled && !ms.has_flag(BSDFFlags::delta);
+        float reverse_pdf[2] = { 0.0, 0.0 };
+        [loop]
+        for (uint e = 0; e < 3; e++) {
+            if (!(e == 0 ? nee : e == 1 ? nee && nee_reachable : bsdf_reverse))
+                continue;
+            if (e > 0 && depth <= 1) {
+                reverse_pdf[e - 1] = 1.0;
+                continue;
+            }
+            IMaterialInstance eval_mi = mi;
+            SurfaceInteraction eval_si = si;
+            float3 wo = nee_ls.dir_ws;
+            UniformSampleGenerator eval_sg = e == 0 ? sg : UniformSampleGenerator(0);
+            if (e > 0) {
+                eval_si = g_scene.make_triangle_surface_interaction(hit, e == 1 ? nee_ls.dir_ws : ms.wo_ws);
+                eval_si.exterior_ior = si.exterior_ior;
+                eval_mi = hit_material_instance(material_id, eval_si);
+                wo = si.wi_ws;
+            }
+            const BSDFEval be = eval_mi.eval_with_pdf(eval_si, wo, eval_sg);
+            if (e == 0) {
+                nee_f = be.value;
+                nee_bsdf_pdf = be.pdf;
+                sg = eval_sg;
+            } else {
+                reverse_pdf[e - 1] = be.pdf;
+            }
+        }
+        if (nee) {
+            const float nee_ratio = nee_reachable ? lt_ratio * reverse_pdf[0] * nee_lt_ratio : 0.0;
+            float mis = 1.0;
+            if (!nee_ls.nee_only) {
+                if (light_tracing)
+                    mis = 1.0 / (1.0 + (nee_bsdf_pdf / nee_ls.pdf + nee_ratio));
+                else
+                    mis = mis_heuristic(1, nee_ls.pdf, 1, nee_bsdf_pdf);
+            } else if (light_tracing) {
+                mis = 1.0 / (1.0 + nee_ratio);
+            }
+            radiance += throughput * nee_f * nee_ls.weight * mis;
+            if (record) {
+                path_vertices[ik].light = light_record(nee_ls, mis, nee_f);
+                path_vertices[ik].terms.nee = nee_f * nee_ls.weight * mis;
+            }
         }
         if (!sampled)
             break;
@@ -638,7 +753,7 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
                 if (is_primary_hit)
                     lt_unreachable = true;     // the light tracer cannot connect a delta vertex
             } else {
-                lt_ratio *= light_tracer_reverse_pdf(hit, material_id, si, ms.wo_ws, depth) * cos_out / ms.pdf;
+                lt_ratio *= reverse_pdf[1] * cos_out / ms.pdf;
             }
         }
 
@@ -649,16 +764,22 @@ bool trace_path(Ray ray0, inout UniformSampleGenerator sg, out PathRecord rec, b
         delta = ms.has_flag(BSDFFlags::delta);
         ray_origin = offset_ray_origin(si.position_ws, dot(ms.wo_ws, si.normal_ws) >= 0.0 ? si.normal_ws : -si.normal_ws);
         ray_dir = ms.wo_ws;
-        rec.delta_weight[k + 1] = ms.weight;
-        rec.pdf[k + 1] = delta ? 0.0 : ms.pdf;
-        rec.terms[k].step = ms.weight;
+        last_weight = ms.weight;
+        if (record) {
+            path_vertices[ik + path_slots].delta_weight = ms.weight;
+            path_vertices[ik + path_slots].pdf = delta ? 0.0 : ms.pdf;
+            path_vertices[ik].terms.step = ms.weight;
+        }
         float rr;
         if (!any(throughput > 0.0) || !russian_roulette(depth, throughput, sg, rr)) {
-            rec.terms[k].step = float3(0.0);
+            if (record)
+                path_vertices[ik].terms.step = float3(0.0);
             break;
         }
-        rec.step_scale[k] = float3(rr);
-        rec.terms[k].step *= rr;
+        if (record) {
+            path_vertices[ik].step_scale = float3(rr);
+            path_vertices[ik].terms.step *= rr;
+        }
     }
     rec.radiance = radiance;
     return hit_surface;
@@ -679,9 +800,9 @@ float light_tracer_emitter_ratio(TriangleHitInfo hit, SurfaceInteraction si, flo
 
 /// A path from `origin` along `dir` (boundary terms: origin may lie on an edge of the scene, so the first segment
 /// starts at ray_epsilon; a camera ray of the reference path tracer's length).
-bool trace_path(float3 origin, float3 dir, inout UniformSampleGenerator sg, out PathRecord rec)
+bool trace_path(float3 origin, float3 dir, uint slot, inout UniformSampleGenerator sg, out PathRecord rec)
 {
-    return trace_path(Ray(origin, dir, ray_epsilon), sg, rec);
+    return trace_path(Ray(origin, dir, ray_epsilon), slot, sg, rec);
 }
 
 /// Importance of a sensor point, excluding the surface cosine (pinhole, box filter).
@@ -703,86 +824,155 @@ float camera_weight(Vertex v)
     return ratio(g, detach(g)) * v.J;
 }
 
-/// Differentiable terms of path vertex k (their values are rec.terms[k]). With from_camera, vertex 0
-/// includes the camera Jacobian (value 1). The vertex's surface and BSDF are set up once, and the BSDF has
-/// a single call site, so its derivative code is instantiated once. Volume vertices (and the throughput through media,
-/// Russian roulette) are detached factors.
-[Differentiable]
-VertexTerms vertex_terms(float theta, no_diff PathRecord rec, no_diff uint k, no_diff bool from_camera)
+/// VertexRecord flags: vertex k is a volume vertex; the previous vertex has no surface (the path's origin or a volume
+/// vertex); vertex k + 1 exists; vertex k + 1 is a volume vertex.
+static const uint VR_VOLUME = 1;
+static const uint VR_PREV_POINT = 2;
+static const uint VR_FIRST = 4;
+static const uint VR_NEXT = 8;
+static const uint VR_NEXT_VOLUME = 16;
+
+/// What vertex_terms() reads of a path record for vertex k: the work item of the per-vertex backward kernel
+/// (interior.slang).
+struct VertexRecord
 {
-    if (is_volume_vertex(rec, k))
-        return { float3(0), float3(0), rec.terms[k].step };
-    Vertex prev;
+    uint flags;
+    /// The previous vertex's position (VR_PREV_POINT) and hit, the vertex's hit and the next vertex's hit and
+    /// position (VR_NEXT_VOLUME).
+    float3 prev_p;
+    HitRef prev_hit;
+    HitRef hit;
+    HitRef next_hit;
+    float3 next_p;
+    float exterior_ior;
+    float mis;
+    float3 emission;
+    LightRecord light;
+    /// pdf[k + 1] and delta_weight[k + 1] of the path record, step_scale[k].
+    float next_pdf;
+    float3 next_delta_weight;
+    float3 step_scale;
+    /// The path record's miss values (the last vertex).
+    float3 miss_radiance;
+    float3 miss_scale;
+    float3 miss_dir;
+    float miss_pdf;
+};
+
+VertexRecord vertex_record(PathRecord rec, uint k)
+{
+    VertexRecord v = {};
+    const PathVertex cur = path_vertex(rec, k);
+    const uint next = min(k + 1, max_bounces);
+    v.flags = ((cur.flags & VERTEX_VOLUME) != 0 ? VR_VOLUME : 0) | (k == 0 ? VR_FIRST : 0);
     if (k == 0 || is_volume_vertex(rec, k - 1)) {
-        prev.p = k == 0 ? rec.origin : rec.position[k - 1];
+        v.flags |= VR_PREV_POINT;
+        v.prev_p = k == 0 ? rec.origin : path_vertices[path_index(rec, k - 1)].position;
+    } else {
+        v.prev_hit = path_vertices[path_index(rec, k - 1)].hit;
+    }
+    v.hit = cur.hit;
+    if (k + 1 < rec.length) {
+        v.flags |= VR_NEXT;
+        if (is_volume_vertex(rec, next)) {
+            v.flags |= VR_NEXT_VOLUME;
+            v.next_p = path_vertices[path_index(rec, next)].position;
+        } else {
+            v.next_hit = path_vertices[path_index(rec, next)].hit;
+        }
+    }
+    v.exterior_ior = cur.exterior_ior;
+    v.mis = cur.mis;
+    v.emission = cur.emission;
+    v.light = cur.light;
+    v.next_pdf = path_vertices[path_index(rec, next)].pdf;
+    v.next_delta_weight = path_vertices[path_index(rec, next)].delta_weight;
+    v.step_scale = cur.step_scale;
+    v.miss_radiance = rec.miss_radiance;
+    v.miss_scale = rec.miss_scale;
+    v.miss_dir = rec.miss_dir;
+    v.miss_pdf = rec.miss_pdf;
+    return v;
+}
+
+/// Differentiable terms of a path vertex (their values are the path record's terms; only the derivatives are used).
+/// With from_camera, vertex 0 includes the camera Jacobian (value 1). The vertex's surface and BSDF are set up once,
+/// and the BSDF has a single call site, so its derivative code is instantiated once. Volume vertices (and the
+/// throughput through media, Russian roulette) are detached factors.
+[Differentiable]
+VertexTerms vertex_terms(float theta, no_diff VertexRecord v, no_diff bool from_camera)
+{
+    if ((v.flags & VR_VOLUME) != 0)
+        return { float3(0), float3(0), float3(0) };
+    Vertex prev;
+    if ((v.flags & VR_PREV_POINT) != 0) {
+        prev.p = v.prev_p;
         prev.n = float3(0);
         prev.J = 1;
     } else {
-        prev = load_vertex(theta, rec.hit[k - 1]);
+        prev = load_vertex(theta, v.prev_hit);
     }
-    Vertex cur = load_vertex(theta, rec.hit[k]);
-    float scale = k == 0 && from_camera ? camera_weight(cur) : 1.0;
-    Surface s = no_diff make_surface(rec.hit[k], normalize(detach(prev.p - cur.p)), rec.exterior_ior[k]);
+    Vertex cur = load_vertex(theta, v.hit);
+    float scale = (v.flags & VR_FIRST) != 0 && from_camera ? camera_weight(cur) : 1.0;
+    Surface s = no_diff make_surface(v.hit, normalize(detach(prev.p - cur.p)), v.exterior_ior);
     VertexTerms t;
-    t.emission = eval_emission(theta, s, cur.n, prev.p - cur.p, rec.emission[k]) * rec.mis[k] * scale;
+    t.emission = eval_emission(theta, s, cur.n, prev.p - cur.p, v.emission) * v.mis * scale;
     // The BSDF is evaluated towards the light sample and towards the next vertex or the environment.
     float3 wo_light = float3(0), w_light = float3(0);
-    if (rec.light[k].kind != LIGHT_NONE)
-        w_light = light_radiance(theta, cur, rec.light[k], wo_light);
+    if (v.light.kind != LIGHT_NONE)
+        w_light = light_radiance(theta, cur, v.light, wo_light);
     float3 wo_next = float3(0), w_next = float3(0), other_next = float3(0), step = float3(0);
     bool scattered = false;
-    if (k + 1 < rec.length) {
-        if (rec.pdf[k + 1] > 0) {
-            if (is_volume_vertex(rec, k + 1)) {
+    if ((v.flags & VR_NEXT) != 0) {
+        if (v.next_pdf > 0) {
+            if ((v.flags & VR_NEXT_VOLUME) != 0) {
                 // Scattered into a medium: the direction is fixed (no geometric derivative).
-                wo_next = normalize(rec.position[k + 1] - detach(cur.p));
-                w_next = float3(1.0 / rec.pdf[k + 1]);
+                wo_next = normalize(v.next_p - detach(cur.p));
+                w_next = float3(1.0 / v.next_pdf);
             } else {
-                Vertex next = load_vertex(theta, rec.hit[k + 1]);
+                Vertex next = load_vertex(theta, v.next_hit);
                 float g = geometric(cur.p, next);
                 wo_next = normalize(next.p - cur.p);
-                w_next = ratio(g * next.J, detach(rec.pdf[k + 1] * g));
+                w_next = ratio(g * next.J, detach(v.next_pdf * g));
             }
-            other_next = rec.delta_weight[k + 1] * rec.pdf[k + 1];
+            other_next = v.next_delta_weight * v.next_pdf;
             scattered = true;
         } else {
-            step = rec.delta_weight[k + 1] * delta_scale(theta, s, normalize(prev.p - cur.p));
+            step = v.next_delta_weight * delta_scale(theta, s, normalize(prev.p - cur.p));
         }
-    } else if (any(rec.miss_scale > 0)) {
+    } else if (any(v.miss_scale > 0)) {
         // The environment radiance seen by the escaped direction changes with the environment map.
-        float3 e = env_map_radiance(theta, rec.miss_dir);
-        float3 miss = rec.miss_radiance + (e - detach(e)) * rec.miss_scale;
-        if (rec.miss_pdf > 0) {
-            wo_next = rec.miss_dir;
-            w_next = miss / rec.miss_pdf;
-            other_next = rec.delta_weight[k + 1] * rec.miss_pdf;
+        float3 e = env_map_radiance(theta, v.miss_dir);
+        float3 miss = v.miss_radiance + (e - detach(e)) * v.miss_scale;
+        if (v.miss_pdf > 0) {
+            wo_next = v.miss_dir;
+            w_next = miss / v.miss_pdf;
+            other_next = v.next_delta_weight * v.miss_pdf;
             scattered = true;
         } else {
             step = miss * delta_scale(theta, s, normalize(prev.p - cur.p));
         }
     }
     float3 f_light, f_next;
-    eval_bsdf(theta, s, normalize(prev.p - cur.p), wo_light, wo_next, rec.light[k].bsdf, other_next, f_light, f_next);
+    eval_bsdf(theta, s, normalize(prev.p - cur.p), wo_light, wo_next, v.light.bsdf, other_next, f_light, f_next);
     t.nee = f_light * w_light * scale;
-    t.step = (scattered ? f_next * w_next : step) * rec.step_scale[k] * scale;
+    t.step = (scattered ? f_next * w_next : step) * v.step_scale * scale;
     return t;
 }
 
 /// suffix[k] = emission + nee + step * suffix[k + 1] with suffix[length] = 1: the radiance that vertices
-/// k, k + 1, ... send towards vertex k - 1, relative to the throughput reaching vertex k. Returns the path
-/// value.
-float3 path_terms(PathRecord rec, out float3 suffix[MAX_DEPTH + 2])
+/// k, k + 1, ... send towards vertex k - 1, relative to the throughput reaching vertex k. Writes suffix[k + 1] to
+/// each recorded vertex k (PathVertex.tail) and returns the path value.
+float3 path_terms(PathRecord rec)
 {
-    suffix[rec.length] = 1;
-    for (int k = int(rec.length) - 1; k >= 0; k--)
-        suffix[k] = rec.terms[k].emission + rec.terms[k].nee + rec.terms[k].step * suffix[k + 1];
-    return rec.length == 0 ? rec.miss_radiance : suffix[0];
-}
-
-float3 path_value(PathRecord rec)
-{
-    float3 suffix[MAX_DEPTH + 2];
-    return path_terms(rec, suffix);
+    float3 suffix = 1;
+    for (int k = int(rec.length) - 1; k >= 0; k--) {
+        const uint i = path_index(rec, k);
+        path_vertices[i].tail = suffix;
+        const VertexTerms t = path_vertices[i].terms;
+        suffix = t.emission + t.nee + t.step * suffix;
+    }
+    return rec.length == 0 ? rec.miss_radiance : suffix;
 }
 
 /// Forward mode returns (value, derivative); backward mode accumulates `weight * dL/dvalue`. The path
@@ -790,8 +980,7 @@ float3 path_value(PathRecord rec)
 /// the throughput before it and, for the throughput term, the radiance after it.
 float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out float3 derivative)
 {
-    float3 suffix[MAX_DEPTH + 2];
-    float3 value = path_terms(rec, suffix);
+    float3 value = path_terms(rec);
     derivative = 0;
     if (rec.length == 0 && from_camera && any(rec.miss_scale > 0)) {
         // The camera sees the environment map.
@@ -807,18 +996,19 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
         ? max(max_relative_vertex_derivative * length(weight * value), 1e-30) : 0.0;
     float3 prefix = 1;
     for (uint k = 0; k < rec.length; k++) {
+        const float3 tail = path_vertices[path_index(rec, k)].tail;
         if (backward) {
             VertexTerms.Differential d;
             d.emission = weight * prefix;
             d.nee = weight * prefix;
-            d.step = weight * prefix * suffix[k + 1];
+            d.step = weight * prefix * tail;
             var theta = diffPair(0.0);
-            bwd_diff(vertex_terms)(theta, rec, k, from_camera, d);
+            bwd_diff(vertex_terms)(theta, vertex_record(rec, k), from_camera, d);
         } else {
-            let d = fwd_diff(vertex_terms)(diffPair(0.0, 1.0), rec, k, from_camera).d;
-            derivative += prefix * (d.emission + d.nee + d.step * suffix[k + 1]);
+            let d = fwd_diff(vertex_terms)(diffPair(0.0, 1.0), vertex_record(rec, k), from_camera).d;
+            derivative += prefix * (d.emission + d.nee + d.step * tail);
         }
-        prefix *= rec.terms[k].step;
+        prefix *= path_vertices[path_index(rec, k)].terms.step;
     }
     vertex_derivative_limit = 0.0;
     return value;

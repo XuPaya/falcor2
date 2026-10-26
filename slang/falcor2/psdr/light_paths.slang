@@ -257,7 +257,31 @@ void splat_light(RWByteAddressBuffer image, uint index, float3 value)
 }
 
 /// One light path per thread of frame `frame` (the adjoint tracer's trace_light_paths() with s.iteration = frame).
-public void render_light(uint tid, uint count, uint frame)
+/// Vertex n of a recorded light path (light_path_vertices[n * light_path_slots + slot], n < max_bounces): its hit,
+/// the direction towards the light, the sampled camera-side direction with its delta flag and exterior IOR, and its
+/// camera connection, for the derivatives.
+struct LightPathVertex
+{
+    HitRef hit;
+    float3 to_light;
+    float3 next_dir;
+    float next_ior;
+    uint delta;
+    LightConnection conn;
+};
+
+/// The light paths' records (one slot per thread: the host dispatches at most light_path_slots threads at a time).
+RWStructuredBuffer<LightPathVertex> light_path_vertices;
+public uint light_path_slots;
+
+/// Light path `tid` of `count` of a frame (tid0 + tid; one dispatch per chunk of at most light_path_slots paths).
+public void render_light(uint tid, uint tid0, uint count, uint frame)
+{
+    trace_light_path(tid0 + tid, count, frame, tid);
+}
+
+/// Light path `tid` (< count) of a frame, recorded into record slot `slot`.
+void trace_light_path(uint tid, uint count, uint frame, uint slot)
 {
     if (!light_tracing || tid >= count)
         return;
@@ -284,13 +308,7 @@ public void render_light(uint tid, uint count, uint frame)
     Ray ray = Ray(start, e.dir_ws, 0.0, t_exit - max(t_enter, 0.0) + 1.0);
 
     // The path (hits, directions towards the light, sampled camera-side directions, delta flags, exterior IORs) and
-    // its camera connections, for the derivatives.
-    HitRef hits[MAX_DEPTH];
-    float3 to_light[MAX_DEPTH];
-    float3 next_dir[MAX_DEPTH];
-    float next_ior[MAX_DEPTH];
-    bool delta[MAX_DEPTH];
-    LightConnection conn[MAX_DEPTH];
+    // its camera connections, for the derivatives: vertex n is light_path_vertices[n * light_path_slots + slot].
     uint n = 0;
 
     InteriorList interiors = {};
@@ -364,14 +382,18 @@ public void render_light(uint tid, uint count, uint frame)
         LightConnection c = connect_to_camera(v, beta, depth, interiors, mis_nee, mis_hit, sg);
         if (c.connected && !backward)
             splat_light(light_primal, c.pixel, c.value);
-        hits[n].gid = hit.geometry_instance_id;
-        hits[n].prim = hit.primitive_index;
-        hits[n].bary = hit.barycentrics;
-        to_light[n] = v.to_light_ws;
-        next_dir[n] = float3(0);
-        next_ior[n] = 1.0;
-        delta[n] = false;
-        conn[n] = c;
+        {
+            LightPathVertex lv;
+            lv.hit.gid = hit.geometry_instance_id;
+            lv.hit.prim = hit.primitive_index;
+            lv.hit.bary = hit.barycentrics;
+            lv.to_light = v.to_light_ws;
+            lv.next_dir = float3(0);
+            lv.next_ior = 1.0;
+            lv.delta = 0;
+            lv.conn = c;
+            light_path_vertices[n * light_path_slots + slot] = lv;
+        }
         n++;
 
         if (depth >= max_vertices)
@@ -434,9 +456,10 @@ public void render_light(uint tid, uint count, uint frame)
             break;
 
         interiors = next_interiors;
-        delta[n - 1] = is_delta;
-        next_dir[n - 1] = wo;
-        next_ior[n - 1] = camera_ior;
+        const uint last = (n - 1) * light_path_slots + slot;
+        light_path_vertices[last].delta = is_delta ? 1 : 0;
+        light_path_vertices[last].next_dir = wo;
+        light_path_vertices[last].next_ior = camera_ior;
         ray = Ray(offset_ray_origin(v.pos_ws, cos_geom_out >= 0.0 ? v.normal_ws : -v.normal_ws), wo);
     }
     if (!light_derivatives)
@@ -445,19 +468,24 @@ public void render_light(uint tid, uint count, uint frame)
     // The emitted radiance's primal value at the light (emissive materials: for the ratio carrier).
     float3 emitted = float3(1.0);
     if (backward) {
-        // Each factor's adjoint is the sum of the dL/dI-weighted connections that contain it.
+        // Each factor's adjoint is the sum of the dL/dI-weighted connections that contain it. A vertex's two factors
+        // (towards the next vertex, f = 0, then towards the camera, f = 1) share one call site: the factor's derivative
+        // code is inlined at each.
         float3 suffix = 0.0;
         for (int k = int(n) - 1; k >= 0; k--) {
-            if (k + 1 < int(n) && any(suffix != 0.0) && any(next_dir[k] != 0.0)) {
+            const LightPathVertex lv = light_path_vertices[k * light_path_slots + slot];
+            float3 a = lv.conn.connected ? dl_di[lv.conn.pixel] * lv.conn.value * light_sample_weight : float3(0.0);
+            [loop]
+            for (uint f = 0; f < 2; f++) {
+                if (f == 0 ? !(k + 1 < int(n) && any(suffix != 0.0) && any(lv.next_dir != 0.0)) : !lv.conn.connected)
+                    continue;
                 var theta = diffPair(0.0);
-                bwd_diff(light_path_factor)(theta, hits[k], next_dir[k], to_light[k], delta[k], next_ior[k], suffix);
+                bwd_diff(light_path_factor)(theta, lv.hit, f == 0 ? lv.next_dir : lv.conn.dir, lv.to_light,
+                                            f == 0 ? lv.delta != 0 : false, f == 0 ? lv.next_ior : lv.conn.exterior_ior,
+                                            f == 0 ? suffix : a);
             }
-            if (conn[k].connected) {
-                float3 a = dl_di[conn[k].pixel] * conn[k].value * light_sample_weight;
-                var theta = diffPair(0.0);
-                bwd_diff(light_path_factor)(theta, hits[k], conn[k].dir, to_light[k], false, conn[k].exterior_ior, a);
+            if (lv.conn.connected)
                 suffix += a;
-            }
         }
         if (any(suffix != 0.0)) {
             var theta = diffPair(0.0);
@@ -467,16 +495,24 @@ public void render_light(uint tid, uint count, uint frame)
         float3 prefix = fwd_diff(light_emission_factor)(diffPair(0.0, 1.0), uint(e.type), e.index, light_hit, e.dir_ws,
                                                         emitted).d;
         for (uint k = 0; k < n; k++) {
-            if (conn[k].connected) {
-                float3 d = fwd_diff(light_path_factor)(diffPair(0.0, 1.0), hits[k], conn[k].dir, to_light[k], false,
-                                                       conn[k].exterior_ior).d;
-                float3 value = conn[k].value * light_sample_weight * (prefix + d);
-                if (all(isfinite(value)))
-                    add_light_image(light_interior, conn[k].pixel, value);
+            const LightPathVertex lv = light_path_vertices[k * light_path_slots + slot];
+            // The vertex's camera connection (f = 0), then its factor towards the next vertex (f = 1), through one call
+            // site.
+            [loop]
+            for (uint f = 0; f < 2; f++) {
+                if (f == 0 ? !lv.conn.connected : !(k + 1 < n && any(lv.next_dir != 0.0)))
+                    continue;
+                float3 d = fwd_diff(light_path_factor)(diffPair(0.0, 1.0), lv.hit, f == 0 ? lv.conn.dir : lv.next_dir,
+                                                       lv.to_light, f == 0 ? false : lv.delta != 0,
+                                                       f == 0 ? lv.conn.exterior_ior : lv.next_ior).d;
+                if (f == 0) {
+                    float3 value = lv.conn.value * light_sample_weight * (prefix + d);
+                    if (all(isfinite(value)))
+                        add_light_image(light_interior, lv.conn.pixel, value);
+                } else {
+                    prefix += d;
+                }
             }
-            if (k + 1 < n && any(next_dir[k] != 0.0))
-                prefix += fwd_diff(light_path_factor)(diffPair(0.0, 1.0), hits[k], next_dir[k], to_light[k], delta[k],
-                                                      next_ior[k]).d;
         }
     }
 }
@@ -495,4 +531,14 @@ bool light_intersect_sphere(float3 origin, float3 dir, float3 center, float radi
     t0 = -b - s;
     t1 = -b + s;
     return true;
+}
+
+/// Backward mode: the light paths of `frames` frames in few dispatches (path tid0 + tid: frame0 + its quotient by count,
+/// path its remainder; at most light_path_slots threads per dispatch).
+public void render_light_frames(uint tid, uint tid0, uint count, uint frames, uint frame0)
+{
+    const uint path = tid0 + tid;
+    if (path >= count * frames)
+        return;
+    trace_light_path(path % count, count, frame0 + path / count, tid);
 }
