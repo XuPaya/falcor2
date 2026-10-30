@@ -10,6 +10,13 @@ public bool is_set<T : __EnumType>(T value, T flag)
     return value & flag;
 }
 
+// Unscoped uint enums are integer aliases in newer Slang compilers.
+[ForceInline]
+public bool is_set(uint value, uint flag)
+{
+    return (value & flag) != 0;
+}
+
 /// Toggle flag in value.
 public void flip_bit<T : __EnumType>(inout T value, T flag)
 {

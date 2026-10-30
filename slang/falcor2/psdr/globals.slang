@@ -35,6 +35,16 @@ public uint photon_count;
 static float vertex_derivative_limit = 0.0;
 /// Link-time constant selecting backward or forward mode, so each kernel contains one of them.
 public extern static const bool backward;
+/// Use inline traversal when available; otherwise the tracing entry points run as ray-generation shaders.
+public extern static const bool USE_RAY_QUERY = true;
+// Keep absent reverse-mode material implementations out of Vulkan programs.
+public extern static const bool HAS_STANDARD_MATERIAL = true;
+public extern static const bool HAS_OPENPBR_MATERIAL = true;
+public extern static const bool HAS_SPONGECAKE_MATERIAL = true;
+/// Heavy BSDF derivative family of this pass, or all families. Surface/emitter decoding remains scene-wide.
+public extern static const uint BACKWARD_MATERIAL_FAMILY = 0xffffffff;
+/// Camera misses and light-source emission do not belong to a surface vertex; accumulate them in one pass.
+public extern static const bool INCLUDE_SHARED_DERIVATIVES = true;
 public uint seed;
 public uint standard_type_id;
 public uint openpbr_type_id;

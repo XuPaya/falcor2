@@ -41,6 +41,11 @@ COMPILE_ORDER = [("render_light_frames", True), ("render_interior", True), ("ren
                  ("render_secondary", True), ("render_secondary", False), ("render_pixel_boundary", True),
                  ("render_pixel_boundary", False), ("render_primary", True), ("render_primary", False),
                  ("record_interior", True), ("render_primal", False), ("sample_photons", False)]
+TRACING_KERNELS = {"render_primal", "record_interior", "render_interior", "render_pixel_boundary",
+                   "render_primary", "render_secondary", "render_light", "render_light_frames"}
+# Matches MATERIAL_* in materials.slang; other material types have detached BSDFs but geometric derivatives.
+MATERIAL_FAMILIES = {"StandardMaterial": 1, "OpenPBRMaterial": 2, "SpongeCakeMaterial": 3}
+MATERIAL_BACKWARD_KERNELS = {"backward_vertices", "render_interior", "render_light", "render_light_frames"}
 
 
 class PSDR:
@@ -63,6 +68,9 @@ class PSDR:
     ``photon_edge_count`` edges of total length ``photon_edge_length`` (boundary and convex sharp edges of every
     mesh) in proportion to length. More photons per pass cut its variance; e.g. one per edge, or about one per
     photon_radius of edge length.
+
+    ``traversal``: "auto" uses inline ray queries when available and a TraceRay pipeline otherwise.
+    "ray_query" or "trace_ray" explicitly selects a supported implementation, for comparisons and debugging.
 
     ``vertex_grad_clamp`` (default VERTEX_GRAD_CLAMP; 0: off): backward mode bounds each path sample's interior-term
     vertex gradient to vertex_grad_clamp / scene extent x its dL/dI-weighted contribution. Sharp glossy lobes make
@@ -90,9 +98,21 @@ class PSDR:
         light_sampler: Optional[f2.LightSampler] = None,
         photon_count: int = PHOTON_EMISSIONS,
         rr_depth: Optional[int] = 3,
+        traversal: str = "auto",
     ):
         if max_bounces < 0:
             raise ValueError("max_bounces must be non-negative")
+        if traversal not in ("auto", "ray_query", "trace_ray"):
+            raise ValueError("traversal must be auto, ray_query or trace_ray")
+        if traversal == "auto":
+            traversal = "ray_query" if device.has_feature(spy.Feature.ray_query) else "trace_ray"
+        feature = spy.Feature.ray_query if traversal == "ray_query" else spy.Feature.ray_tracing
+        if not device.has_feature(feature):
+            raise RuntimeError(
+                f"PSDR traversal={traversal!r} is unsupported by {device.info.adapter_name} "
+                f"({device.info.type.name}); ray queries or a ray-tracing pipeline are required."
+            )
+        self.traversal = traversal
         scene.update()
         self.device, self.scene, self.max_bounces = device, scene, max_bounces
         self.width, self.height = camera.width, camera.height
@@ -103,13 +123,56 @@ class PSDR:
         conformances = scene.requirements.type_conformances
         type_ids = {c.type_name: c.id for c in conformances if c.interface_name == "IMaterial"}
         self._light_sampler = light_sampler or f2.PowerLightSampler()
-        # The kernels depend on the scene only through run-time values (the scene's materials are always all
-        # built-in material types; the light sampler a run-time choice), so other scenes reuse their programs.
+        # Query kernels share programs across scenes. Pipeline kernels specialize derivative material families
+        # so absent reverse-mode implementations do not enter the Vulkan program.
         prelude = light_sampler_prelude(self._light_sampler)
+        use_ray_query = traversal == "ray_query"
+        materials = list(scene.materials)
+        self._material_types = frozenset(m.slang_type_name for m in materials)
+        # Keep the large reverse-mode BSDF implementations in separate Vulkan programs when all are present.
+        # The first family pass also owns derivatives that do not belong to a surface vertex.
+        partition_backward = (not use_ray_query and device.info.type == spy.DeviceType.vulkan
+                              and set(MATERIAL_FAMILIES) <= self._material_types)
+        self._backward_material_families = (
+            tuple(MATERIAL_FAMILIES.values()) + ((0,) if self._material_types.difference(MATERIAL_FAMILIES) else ())
+            if partition_backward else ()
+        )
+        material_constants = ({f"HAS_{kind}_MATERIAL": name in self._material_types for kind, name in (
+            ("STANDARD", "StandardMaterial"), ("OPENPBR", "OpenPBRMaterial"), ("SPONGECAKE", "SpongeCakeMaterial"))}
+            if not use_ray_query else {})
+        rt_setup = None
+        if not use_ray_query:
+            ray_descs = []
+            for name, closest_hit in (("psdr_intersect", True), ("psdr_visibility", False)):
+                ray = f2.SceneRayTracingSetup.RayDesc()
+                ray.name, ray.has_miss, ray.has_any_hit = name, True, True
+                ray.has_closest_hit = closest_hit
+                ray_descs.append(ray)
+            rt_setup = f2.SceneRayTracingSetup.create(scene, ray_descs)
 
-        def query(name, backward=False):
-            function = getattr(module, name).constants({"backward": backward}).prelude(prelude)
-            return function.type_conformances(conformances).write(self._helper.bind_scene)
+        def query(name, backward=False, family=None, include_shared=True):
+            constants = {"backward": backward, "USE_RAY_QUERY": use_ray_query, **material_constants}
+            if family is not None:
+                constants.update(BACKWARD_MATERIAL_FAMILY=family, INCLUDE_SHARED_DERIVATIVES=include_shared)
+            tracing = rt_setup is not None and name in TRACING_KERNELS
+            if tracing:
+                hit_groups = list(rt_setup.hit_groups)
+                hit_names = list(rt_setup.sbt_hit_group_names)
+                miss_names = list(rt_setup.sbt_miss_entry_points)
+                if name == "render_secondary":
+                    constants.update(PHOTON_HIT_GROUP_INDEX=len(hit_names), PHOTON_MISS_INDEX=len(miss_names))
+                    hit_groups.append({"hit_group_name": "psdr_photon_hit_group",
+                                       "intersection_entry_point": "psdr_photon_intersection",
+                                       "any_hit_entry_point": "psdr_photon_any_hit"})
+                    hit_names.append("psdr_photon_hit_group")
+                    miss_names.append("psdr_photon_miss")
+            function = getattr(module, name).constants(constants).prelude(prelude)
+            function = function.type_conformances(conformances).write(self._helper.bind_scene)
+            if tracing:
+                function = function.ray_tracing(hit_groups=hit_groups, hit_group_names=hit_names,
+                                               miss_entry_points=miss_names, max_recursion=1,
+                                               max_ray_payload_size=160, flags=rt_setup.pipeline_flags)
+            return function
 
         self._query = query
         self.normal_map_derivatives = None  # backward()'s argument while it runs
@@ -122,7 +185,6 @@ class PSDR:
                     self.instances[component.geometry_instance_id + i] = (component, i)
         self._info = {gid: np.asarray(query("instance_info")(gid), dtype=np.uint32) for gid in self.instances}
         self.vertex_count = int(max((int(i[0] + i[1]) for i in self._info.values()), default=0))
-        materials = [m for m in scene.materials]
         self.material_slots = {m.material_id: m.material_id * MATERIAL_SLOTS for m in materials}
         light_slot_base = (max((m.material_id for m in materials), default=-1) + 1) * MATERIAL_SLOTS
 
@@ -205,11 +267,11 @@ class PSDR:
         self._light_tracing = None
         # Debugging: read the vertex item count after each record_interior() dispatch (vertex_item_stats).
         self.check_vertex_items = False
-        # Backward mode: the interior term in two kernels (record_interior + backward_vertices, ~3x faster; False:
-        # render_interior, as forward mode) and the frames' light paths in merged dispatches.
+        # Record camera paths once, then differentiate their vertices (with material-family passes when needed).
+        # False uses render_interior, replaying paths within each derivative kernel, as in forward mode.
         self.split_interior = True
         self.merge_light_frames = True
-        # Kernels by (name, backward), compiled on first use (or by compile_kernels()).
+        # Kernels by name, differentiation mode and material specialization, compiled on first use.
         self._kernels = {}
         self.photon_count = photon_count
         self._upload_scene_state()
@@ -287,6 +349,10 @@ class PSDR:
     def update(self, geometry: bool = True):
         """Refresh the scene-dependent state after ``scene.update()``: light values and, with geometry, the
         edge lists (needed after vertex or transform changes; rebuilt when a pass next samples edges)."""
+        if self.traversal == "trace_ray" and any(
+            m.slang_type_name not in self._material_types for m in self.scene.materials
+        ):
+            raise RuntimeError("The scene gained a material type; recreate PSDR to rebuild its specialized kernels.")
         if geometry:
             self._refresh_layout()
             self._edges_stale = True
@@ -552,7 +618,8 @@ class PSDR:
         """Builds every kernel of forward() and backward() (with light_tracing, also the light term's; as selected by
         split_interior and merge_light_frames) in one command list. On a device created with pipeline_compilation_mode=parallel their programs then compile concurrently,
         instead of one after another as the passes first use them; programs in the device's shader cache load from it.
-        The kernels do not depend on the scene (see __init__), so this compiles once per shader cache.
+        Pipeline kernels are cached per material-family configuration (see __init__); query kernels share the cache
+        across scenes. Backward material variants are separate dispatches and count towards ``max_parallel``.
 
         Each kernel runs on one thread (the dispatch that makes the device compile it), mostly with no work to do;
         the output and gradient buffers are cleared afterwards. ``max_parallel``: kernels per command list (each
@@ -586,16 +653,18 @@ class PSDR:
         overrides = {"primary_edge_count": 0, "photon_edge_count": max(1, len(getattr(self, "_photon", ())))}
         outputs = ["primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
                    "light_interior", "vertex_grad", "param_grad", "vertex_item_count"]
-        dispatches = [(name, backward, kwargs) for name, modes, kwargs in kernels for backward in modes
-                      if names is None or name in names]
+        dispatches = [(name, backward, family, shared, kwargs)
+                      for name, modes, kwargs in kernels for backward in modes
+                      if names is None or name in names
+                      for family, shared in self._kernel_specializations(name, backward)]
         # Largest programs first (a command list compiles as long as its slowest program; their sizes in inlined HLSL
         # lines order them, ~0.1-0.9 M).
         dispatches.sort(key=lambda d: COMPILE_ORDER.index((d[0], d[1])) if (d[0], d[1]) in COMPILE_ORDER else 99)
         for first in range(0, len(dispatches), max(1, max_parallel)):
             encoder = self.device.create_command_encoder()
             encoder.clear_buffer(self._buffers["vertex_item_count"])
-            for name, backward, kwargs in dispatches[first:first + max(1, max_parallel)]:
-                self._kernel(name, backward).write(self._binder(0, overrides)).append_to(encoder, **kwargs)
+            for name, backward, family, shared, kwargs in dispatches[first:first + max(1, max_parallel)]:
+                self._kernel(name, backward, family, shared).write(self._binder(0, overrides)).append_to(encoder, **kwargs)
             self.device.submit_command_buffer(encoder.finish())
         encoder = self.device.create_command_encoder()
         for name in outputs:
@@ -603,9 +672,10 @@ class PSDR:
         self.device.submit_command_buffer(encoder.finish())
 
     def _backward_interior(self, spp: int, seed: int, antithetic: bool):
-        """The backward interior term in two kernels per chunk of samples and rows: record_interior() writes the camera
-        paths' surface vertices as work items, backward_vertices() differentiates one per thread. Chunks are sized so
-        that their items fit the item buffer even if every path has the maximum length."""
+        """Record each chunk of camera paths once, then differentiate its surface vertices, one per thread.
+
+        backward_vertices() uses separate material-family passes when needed. Chunks are sized so their items fit
+        the item buffer even if every path has the maximum length."""
         capacity = self._vertex_item_buffers()
         per_row = self.width * 2 * (self.max_bounces + 1)  # items of a row of pixel samples at most
         # One record slot per thread (pixel sample).
@@ -666,10 +736,18 @@ class PSDR:
             self._globals["vertex_item_capacity"] = capacity
         return self._globals["vertex_item_capacity"]
 
-    def _kernel(self, name: str, backward: bool):
-        if (name, backward) not in self._kernels:
-            self._kernels[name, backward] = self._query(name, backward)
-        return self._kernels[name, backward]
+    def _kernel_specializations(self, name: str, backward: bool):
+        if backward and name in MATERIAL_BACKWARD_KERNELS and self._backward_material_families:
+            return tuple((family, i == 0) for i, family in enumerate(self._backward_material_families))
+        return ((None, True),)
+
+    def _kernel(self, name: str, backward: bool, family=None, include_shared=True):
+        if backward and name in MATERIAL_BACKWARD_KERNELS and self._backward_material_families and family is None:
+            raise ValueError("Select a backward material family, or use backward() / compile_kernels().")
+        key = (name, backward, family, include_shared)
+        if key not in self._kernels:
+            self._kernels[key] = self._query(name, backward, family, include_shared)
+        return self._kernels[key]
 
     def _binder(self, seed: int, overrides: Optional[dict] = None):
         def bind(cursor):
@@ -693,7 +771,8 @@ class PSDR:
         return bind
 
     def _call(self, name: str, backward: bool, seed: int, **kwargs):
-        self._kernel(name, backward).write(self._binder(seed))(**kwargs)
+        for family, shared in self._kernel_specializations(name, backward):
+            self._kernel(name, backward, family, shared).write(self._binder(seed))(**kwargs)
 
     def _normal_map_kernels(self) -> bool:
         """Whether the kernels differentiate shading frames through normal maps (see normal_map_derivatives)."""
@@ -725,7 +804,8 @@ class PSDR:
             builds = []
             inputs = [spy.AccelerationStructureBuildInputProceduralPrimitives({
                 "aabb_buffers": [self._buffers["photon_bounds"]], "aabb_stride": 24,
-                "primitive_count": self.photon_count})]
+                "primitive_count": self.photon_count,
+                "flags": spy.AccelerationStructureGeometryFlags.no_duplicate_any_hit_invocation})]
             for kind in (spy.AccelerationStructureKind.bottom_level, spy.AccelerationStructureKind.top_level):
                 desc = spy.AccelerationStructureBuildDesc(
                     {"inputs": inputs, "flags": spy.AccelerationStructureBuildFlags.prefer_fast_build})

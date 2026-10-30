@@ -226,6 +226,8 @@ bool russian_roulette(uint depth, inout float3 throughput, inout UniformSampleGe
 /// reference path tracer's any-hit shader evaluates the same opacity per candidate).
 bool intersect_opacity(Ray ray, OpacityEvaluator opacity, out TriangleHitInfo hit)
 {
+    if (!USE_RAY_QUERY)
+        return trace_scene_closest(ray.to_ray_desc(), opacity, OpacityEvaluator.RAY_FLAGS, hit);
     hit = TriangleHitInfo(GeometryInstanceID(0), 0, float2(0));
     RayQuery<OpacityEvaluator.RAY_FLAGS> q;
     q.TraceRayInline(g_scene.tlas, 0, 0xff, ray.to_ray_desc());
@@ -247,6 +249,8 @@ bool intersect_opacity(Ray ray, OpacityEvaluator opacity, out TriangleHitInfo hi
 
 bool occluded_opacity(Ray ray, OpacityEvaluator opacity)
 {
+    if (!USE_RAY_QUERY)
+        return !trace_scene_visible(ray.to_ray_desc(), opacity, OpacityEvaluator.RAY_FLAGS);
     RayQuerySceneIntersector intersector = RayQuerySceneIntersector(opacity);
     return intersector.is_occluded(ray, SHADING_HINTS);
 }
@@ -985,8 +989,10 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
     if (rec.length == 0 && from_camera && any(rec.miss_scale > 0)) {
         // The camera sees the environment map.
         if (backward) {
-            var theta = diffPair(0.0);
-            bwd_diff(env_map_radiance)(theta, rec.miss_dir, weight);
+            if (INCLUDE_SHARED_DERIVATIVES) {
+                var theta = diffPair(0.0);
+                bwd_diff(env_map_radiance)(theta, rec.miss_dir, weight);
+            }
         } else {
             derivative = fwd_diff(env_map_radiance)(diffPair(0.0, 1.0), rec.miss_dir).d;
         }
@@ -998,12 +1004,15 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
     for (uint k = 0; k < rec.length; k++) {
         const float3 tail = path_vertices[path_index(rec, k)].tail;
         if (backward) {
-            VertexTerms.Differential d;
-            d.emission = weight * prefix;
-            d.nee = weight * prefix;
-            d.step = weight * prefix * tail;
-            var theta = diffPair(0.0);
-            bwd_diff(vertex_terms)(theta, vertex_record(rec, k), from_camera, d);
+            VertexRecord v = vertex_record(rec, k);
+            if ((v.flags & VR_VOLUME) == 0 && backward_material_hit(v.hit)) {
+                VertexTerms.Differential d;
+                d.emission = weight * prefix;
+                d.nee = weight * prefix;
+                d.step = weight * prefix * tail;
+                var theta = diffPair(0.0);
+                bwd_diff(vertex_terms)(theta, v, from_camera, d);
+            }
         } else {
             let d = fwd_diff(vertex_terms)(diffPair(0.0, 1.0), vertex_record(rec, k), from_camera).d;
             derivative += prefix * (d.emission + d.nee + d.step * tail);

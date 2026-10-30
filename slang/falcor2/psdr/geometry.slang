@@ -83,6 +83,14 @@ bool intersect(float3 origin, float3 dir, float t_max, out HitRef h)
 {
     h = {};
     RayDesc ray = { origin, ray_epsilon, dir, t_max };
+    if (!USE_RAY_QUERY) {
+        TriangleHitInfo hit;
+        bool found = trace_scene_closest(ray, OpacityEvaluator(0), RAY_FLAG_FORCE_OPAQUE, hit);
+        h.gid = hit.geometry_instance_id;
+        h.prim = hit.primitive_index;
+        h.bary = hit.barycentrics;
+        return found;
+    }
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     q.TraceRayInline(g_scene.tlas, RAY_FLAG_NONE, 0xff, ray);
     while (q.Proceed()) {}
@@ -101,6 +109,9 @@ bool visible(float3 a, float3 b)
     if (t <= 2 * ray_epsilon)
         return true;
     RayDesc ray = { a, ray_epsilon, d / t, t - ray_epsilon };
+    if (!USE_RAY_QUERY)
+        return trace_scene_visible(ray, OpacityEvaluator(0),
+                                   RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES);
     RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
     q.TraceRayInline(g_scene.tlas, RAY_FLAG_NONE, 0xff, ray);
     while (q.Proceed()) {}

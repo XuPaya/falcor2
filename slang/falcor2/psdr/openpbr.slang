@@ -841,10 +841,9 @@ void eval_openpbr(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, floa
     OpenPBR_ResolvedInputs inputs = openpbr_inputs(theta, s);
     OpenPBR_PreparedBsdf bsdf
         = openpbr_prepare(inputs, float3(1.0), OpenPBR_BaseRgbWavelengths_nm, s.si.exterior_ior, wi_ws);
-    // Both directions through one call site, so the evaluation's derivative code is instantiated once.
     float3 f[2] = { float3(0), float3(0) };
-    [MaxIters(2)]
-    [loop]
+    // Unroll the fixed directions to work around Vulkan reverse-mode loop failures.
+    [ForceUnroll]
     for (uint d = 0; d < 2; d++) {
         float3 wo = d == 0 ? wo1 : wo2;
         if (any(detach(wo) != 0)) {

@@ -170,6 +170,8 @@ public void backward_vertices(uint tid)
     if (tid >= min(vertex_item_count.Load(0), vertex_item_capacity))
         return;
     VertexItem item = vertex_items[tid];
+    if (!backward_material_hit(item.v.hit))
+        return;
     vertex_derivative_limit = item.limit;
     VertexTerms.Differential d;
     d.emission = item.d_terms;

@@ -22,6 +22,7 @@ import falcor2.render;
 import falcor2.utils;
 
 __include "globals.slang";
+__include "ray_tracing.slang";
 __include "parameters.slang";
 __include "geometry.slang";
 __include "materials.slang";

@@ -13,6 +13,25 @@ static const uint MATERIAL_STANDARD = 1;
 static const uint MATERIAL_OPENPBR = 2;
 static const uint MATERIAL_SPONGECAKE = 3;
 
+bool backward_material_family(uint family)
+{
+    return BACKWARD_MATERIAL_FAMILY == 0xffffffff || BACKWARD_MATERIAL_FAMILY == family;
+}
+
+/// Select the current vertex only. Its derivative may still write to neighboring vertices or an emitter of
+/// another family, so neither geometry/parameter writes nor surface/emission decoding are filtered.
+bool backward_material_hit(HitRef h)
+{
+    if (BACKWARD_MATERIAL_FAMILY == 0xffffffff)
+        return true;
+    MaterialID material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
+    uint type = g_scene.material_system.get_material_data(material).header.type_id;
+    uint family = type == standard_type_id ? MATERIAL_STANDARD
+        : type == openpbr_type_id ? MATERIAL_OPENPBR
+        : type == spongecake_type_id ? MATERIAL_SPONGECAKE : MATERIAL_OTHER;
+    return backward_material_family(family);
+}
+
 /// Non-differentiable shading context of a path vertex, built from the primal incident direction.
 struct Surface
 {
@@ -35,14 +54,14 @@ Surface make_surface(HitRef h, float3 wi_ws, float exterior_ior = 1.0)
     s.material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
     s.slot = uint(s.material) * MATERIAL_SLOTS;
     MaterialData data = g_scene.material_system.get_material_data(s.material);
-    if (data.header.type_id == standard_type_id) {
+    if (HAS_STANDARD_MATERIAL && data.header.type_id == standard_type_id) {
         s.kind = MATERIAL_STANDARD;
         s.standard = reinterpret<StandardMaterial>(data);
         s.standard_instance = s.standard.setup_material_instance(s.si, ExplicitLodSampler(), SHADING_HINTS);
-    } else if (data.header.type_id == openpbr_type_id) {
+    } else if (HAS_OPENPBR_MATERIAL && data.header.type_id == openpbr_type_id) {
         s.kind = MATERIAL_OPENPBR;
         s.openpbr = reinterpret<OpenPBRMaterial>(data);
-    } else if (data.header.type_id == spongecake_type_id) {
+    } else if (HAS_SPONGECAKE_MATERIAL && data.header.type_id == spongecake_type_id) {
         s.kind = MATERIAL_SPONGECAKE;
         s.spongecake = reinterpret<SpongeCakeMaterial>(data);
     }
@@ -181,7 +200,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 {
     f1 = float3(0);
     f2 = float3(0);
-    if (s.kind == MATERIAL_STANDARD) {
+    if (HAS_STANDARD_MATERIAL && backward_material_family(MATERIAL_STANDARD) && s.kind == MATERIAL_STANDARD) {
         UniformSampleGenerator sg = UniformSampleGenerator(0);
         Frame frame = standard_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
@@ -191,17 +210,16 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
             f1 = bsdf.eval(wi_ls, wo_ls1, sg, BSDFContext());
         if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls2, wo2))
             f2 = bsdf.eval(wi_ls, wo_ls2, sg, BSDFContext());
-    } else if (s.kind == MATERIAL_OPENPBR) {
+    } else if (HAS_OPENPBR_MATERIAL && backward_material_family(MATERIAL_OPENPBR) && s.kind == MATERIAL_OPENPBR) {
         eval_openpbr(theta, s, wi_ws, wo1, wo2, f1, f2);
-    } else if (s.kind == MATERIAL_SPONGECAKE) {
+    } else if (HAS_SPONGECAKE_MATERIAL && backward_material_family(MATERIAL_SPONGECAKE) && s.kind == MATERIAL_SPONGECAKE) {
         Frame frame = spongecake_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
         SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
         Frame primal = detach(frame);
-        // Both directions through one call site (the evaluation's derivative code is instantiated once).
+        // Unroll the fixed directions to work around Vulkan reverse-mode loop failures.
         float3 f[2] = { float3(0), float3(0) };
-        [MaxIters(2)]
-        [loop]
+        [ForceUnroll]
         for (uint d = 0; d < 2; d++) {
             float3 wo = d == 0 ? wo1 : wo2, wo_ls = d == 0 ? wo_ls1 : wo_ls2;
             if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls, wo))
@@ -221,7 +239,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 [Differentiable]
 float delta_scale(float theta, no_diff Surface s, float3 wi_ws)
 {
-    if (s.kind != MATERIAL_SPONGECAKE)
+    if (!HAS_SPONGECAKE_MATERIAL || !backward_material_family(MATERIAL_SPONGECAKE) || s.kind != MATERIAL_SPONGECAKE)
         return 1.0;
     Frame frame = spongecake_frame(theta, s);
     SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
@@ -243,11 +261,11 @@ float3 eval_emission(float theta, no_diff Surface s, float3 normal, float3 to_ws
 {
     if (dot(detach(normal), detach(to_ws)) <= 0 && !emits_both_sides(s))
         return float3(0);
-    if (s.kind == MATERIAL_STANDARD)
+    if (HAS_STANDARD_MATERIAL && s.kind == MATERIAL_STANDARD)
         return texture_param(theta, s.standard.emissive_texture.data, s.si.uv,
                              s.standard.emissive_texture.sample(ExplicitLodSampler(), s.si.uv, float4(1.0))).rgb
             * param3(theta, s.standard.emissive_factor, s.slot + 6);
-    if (s.kind == MATERIAL_OPENPBR)
+    if (HAS_OPENPBR_MATERIAL && s.kind == MATERIAL_OPENPBR)
         return openpbr_emission(theta, s);
     return other;
 }

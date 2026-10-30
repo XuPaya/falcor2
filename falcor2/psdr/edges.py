@@ -27,7 +27,9 @@ def edge_topology(faces: np.ndarray, positions: np.ndarray):
     key, face, k = key[order], face[order], k[order]
     starts = np.flatnonzero(np.concatenate(([True], key[1:] != key[:-1])))
     counts = np.diff(np.append(starts, len(key)))
-    f1 = np.where(counts == 2, face[np.minimum(starts + 1, len(key) - 1)], -1).astype(np.int32)
+    # Cast before selecting the -1 boundary sentinel; NumPy 2 rejects it for unsigned arrays.
+    neighbor = face[np.minimum(starts + 1, len(key) - 1)].astype(np.int32)
+    f1 = np.where(counts == 2, neighbor, -1)
     return face[starts], k[starts], f1, counts != 2
 
 
