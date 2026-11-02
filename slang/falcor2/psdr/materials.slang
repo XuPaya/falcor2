@@ -36,6 +36,10 @@ bool backward_material_hit(HitRef h)
 struct Surface
 {
     SurfaceInteraction si;
+    HitRef hit;
+    /// The shading frame follows the stored vertex normals and tangents (frame_derivatives, camera-path vertices;
+    /// light-path vertices keep constant frames: no geometric derivatives along light paths).
+    bool vertex_frame;
     MaterialID material;
     uint kind;
     uint slot;
@@ -51,6 +55,7 @@ Surface make_surface(HitRef h, float3 wi_ws, float exterior_ior = 1.0)
     Surface s = {};
     s.si = g_scene.make_triangle_surface_interaction(TriangleHitInfo(h.gid, h.prim, h.bary), wi_ws);
     s.si.exterior_ior = exterior_ior;
+    s.hit = h;
     s.material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
     s.slot = uint(s.material) * MATERIAL_SLOTS;
     MaterialData data = g_scene.material_system.get_material_data(s.material);
@@ -74,15 +79,17 @@ IMaterialInstance material_instance(Surface s)
 }
 
 /// Shading frame with the material's normal map (texels and scale differentiable), as in the materials'
-/// setup_material_instance() with SHADING_HINTS.
+/// setup_material_instance() with SHADING_HINTS. With s.vertex_frame, the interpolated frame is differentiable with
+/// respect to the stored vertex normals and tangents.
 [Differentiable]
 Frame shading_frame(float theta, no_diff Surface s, no_diff uint normal_texture, no_diff float4 sampled, float scale,
                     no_diff bool orient_backface)
 {
-    Frame frame = s.si.shading_frame_ws;
+    Frame frame = vertex_shading_frame(theta, s.hit, s.si.shading_frame_ws, s.vertex_frame);
     if (RawTextureHandle(normal_texture).is_valid()) {
         float3 n = stdmat::decode_normal_map(texture_param(theta, normal_texture, s.si.uv, sampled).xyz);
         n = normalize(lerp(float3(0.0, 0.0, 1.0), n, scale));
+        n = normal_maps ? n : detach(n);
         frame = Frame(frame.to_global(n), frame.tangent, no_diff s.si.shading_frame_ws.handedness_sign());
     }
     frame = stdmat::orient_shading_frame(s.si, frame, orient_backface);
@@ -94,7 +101,7 @@ Frame shading_frame(float theta, no_diff Surface s, no_diff uint normal_texture,
     if (detach(cos_theta) <= 0.1)
         frame = Frame(normalize(sign_n * lerp(ng, sign_n * frame.normal, saturate(cos_theta * 10.0))), frame.tangent,
                       no_diff detach(frame).handedness_sign());
-    return normal_maps ? frame : detach(frame);
+    return normal_maps || s.vertex_frame ? frame : detach(frame);
 }
 
 [Differentiable]

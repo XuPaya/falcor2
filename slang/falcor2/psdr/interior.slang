@@ -179,4 +179,54 @@ public void backward_vertices(uint tid)
     d.step = item.d_step;
     var theta = diffPair(0.0);
     bwd_diff(vertex_terms)(theta, item.v, true, d);
+    if (frame_pending)
+        append_frame_item();
+}
+
+/// The adjoint of a vertex's shading frame (frame_adjoint), chained to the stored vertex normals and tangents by
+/// backward_frames().
+struct FrameItem
+{
+    HitRef hit;
+    float handedness;
+    float limit;
+    float3 d_normal;
+    float3 d_tangent;
+    float3 d_bitangent;
+};
+
+RWStructuredBuffer<FrameItem> frame_items;
+/// Items written (uint at offset 0; at most one per vertex item, so frame_item_capacity >= vertex_item_capacity).
+public RWByteAddressBuffer frame_item_count;
+public uint frame_item_capacity;
+
+void append_frame_item()
+{
+    frame_pending = false;
+    FrameItem item;
+    item.hit = frame_hit;
+    item.handedness = frame_handedness;
+    item.limit = vertex_derivative_limit;
+    item.d_normal = frame_adjoint.normal;
+    item.d_tangent = frame_adjoint.tangent;
+    item.d_bitangent = frame_adjoint.bitangent;
+    uint index;
+    frame_item_count.InterlockedAdd(0, 1, index);
+    if (index < frame_item_capacity)
+        frame_items[index] = item;
+}
+
+/// Backward mode: the frame gradients (frame_grad) of frame item tid.
+public void backward_frames(uint tid)
+{
+    if (tid >= min(frame_item_count.Load(0), frame_item_capacity))
+        return;
+    FrameItem item = frame_items[tid];
+    vertex_derivative_limit = item.limit;
+    Frame.Differential d = Frame.dzero();
+    d.normal = item.d_normal;
+    d.tangent = item.d_tangent;
+    d.bitangent = item.d_bitangent;
+    var theta = diffPair(0.0);
+    bwd_diff(interpolated_frame)(theta, item.hit, item.handedness, d);
 }

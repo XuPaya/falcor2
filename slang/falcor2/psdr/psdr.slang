@@ -7,8 +7,9 @@
 // (algorithm1.cpp), plus pixel-boundary (boundary_pixel.cpp), primary-edge (boundary_primary.cpp)
 // and photon-mapping secondary-edge (boundary_direct_pm.cpp) terms. Sampling, pdfs, MIS weights and
 // visibility are detached. Every derivative enters through world_vertex() and param() (texels are
-// parameters too): forward mode reads tangents and returns image derivatives, backward mode atomically
-// accumulates gradients.
+// parameters too), and with frame_derivatives through vertex_attribute() (the stored vertex normals and tangents
+// that shading frames interpolate): forward mode reads tangents and returns image derivatives, backward mode
+// atomically accumulates gradients.
 //
 // The module's files: globals.slang (shader parameters), parameters.slang and geometry.slang (differentiable
 // scene access), materials.slang and openpbr.slang (BSDFs), lights.slang, paths.slang (path records and the

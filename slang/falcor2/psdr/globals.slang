@@ -49,8 +49,16 @@ public uint seed;
 public uint standard_type_id;
 public uint openpbr_type_id;
 public uint spongecake_type_id;
-/// Whether materials have normal maps. Without them, shading frames are detached (constant).
+/// Whether materials have normal maps. Without them (and without frame_derivatives), shading frames are detached
+/// (constant).
 public bool normal_maps;
+/// Whether the shading frames of camera-path vertices follow the stored vertex normals and tangents they interpolate
+/// (vertex_attribute()): forward mode reads their tangents from frame_tangent, backward mode accumulates their
+/// gradients into frame_grad. Off: the stored frames are constant (the vertex derivatives hold them fixed).
+public bool frame_derivatives;
+/// Backward mode: the frame gradients are bounded by vertex_derivative_limit x frame_limit_scale (the scene extent:
+/// the vertex bound per unit normal change instead of per unit length).
+public float frame_limit_scale;
 public uint light_slot_base;
 public extern struct LightSampler : ILightSampler = PowerLightSampler;
 public ParameterBlock<LightSampler> light_sampler;
@@ -61,6 +69,10 @@ public StructuredBuffer<float> param_tangent;
 /// Object-space vertex gradients (float3 per vertex) and parameter gradients (backward mode).
 public RWByteAddressBuffer vertex_grad;
 public RWByteAddressBuffer param_grad;
+/// Object-space tangents (forward mode: 2 float3 per vertex) and gradients (backward mode: 6 floats per vertex) of
+/// the stored vertex normals and shading tangents, in that order (see frame_derivatives).
+public StructuredBuffer<float3> frame_tangent;
+public RWByteAddressBuffer frame_grad;
 /// Emission property (intensity or radiance) of each light, in LightID order.
 public StructuredBuffer<float3> light_value;
 /// First texel parameter slot of each texture by TextureHandle.texture_index, or NO_SLOT: four slots (RGBA)
