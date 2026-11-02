@@ -915,6 +915,7 @@ VertexTerms vertex_terms(float theta, no_diff VertexRecord v, no_diff bool from_
     Vertex cur = load_vertex(theta, v.hit);
     float scale = (v.flags & VR_FIRST) != 0 && from_camera ? camera_weight(cur) : 1.0;
     Surface s = no_diff make_surface(v.hit, normalize(detach(prev.p - cur.p)), v.exterior_ior);
+    s.vertex_frame = frame_derivatives;
     VertexTerms t;
     t.emission = eval_emission(theta, s, cur.n, prev.p - cur.p, v.emission) * v.mis * scale;
     // The BSDF is evaluated towards the light sample and towards the next vertex or the environment.

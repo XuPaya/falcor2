@@ -35,12 +35,15 @@ LIGHT_PATH_VERTEX_SIZE = 84
 # Backward interior term: memory of the vertex work items (VertexItem, interior.slang: VERTEX_ITEM_SIZE bytes each).
 VERTEX_ITEM_BYTES = 256 << 20
 VERTEX_ITEM_SIZE = 284
+# Backward frame gradients: one FrameItem (interior.slang, FRAME_ITEM_SIZE bytes) per vertex item at most.
+FRAME_ITEM_SIZE = 60
 # compile_kernels(): (kernel, backward) from the largest program to the smallest.
 COMPILE_ORDER = [("render_light_frames", True), ("render_interior", True), ("render_light", True),
                  ("backward_vertices", True), ("render_light", False), ("render_interior", False),
                  ("render_secondary", True), ("render_secondary", False), ("render_pixel_boundary", True),
                  ("render_pixel_boundary", False), ("render_primary", True), ("render_primary", False),
-                 ("record_interior", True), ("render_primal", False), ("sample_photons", False)]
+                 ("record_interior", True), ("render_primal", False), ("sample_photons", False),
+                 ("backward_frames", True)]
 
 
 class PSDR:
@@ -113,6 +116,12 @@ class PSDR:
 
         self._query = query
         self.normal_map_derivatives = None  # backward()'s argument while it runs
+        # Shading frames differentiated with respect to the stored vertex normals and tangents: backward()'s
+        # frame_gradients while it runs; forward(): whether set_tangents() was given frame tangents.
+        self._frame_derivatives = False
+        self._frame_tangents = False
+        # The accumulated gradients include frame gradients (see frame_gradients()).
+        self._frame_grads, self._frame_grads_pending = None, False
 
         # Geometry instances, their vertex ranges and materials.
         self.instances = {}
@@ -179,6 +188,10 @@ class PSDR:
             "param_tangent": buffer(np.zeros(max(1, self.param_count), np.float32)),
             "vertex_grad": buffer(np.zeros(max(1, self.vertex_count) * 3, np.float32)),
             "param_grad": buffer(np.zeros(max(1, self.param_count), np.float32)),
+            "frame_tangent": buffer(np.zeros((2 * max(1, self.vertex_count), 3), np.float32)),
+            "frame_grad": buffer(np.zeros(max(1, self.vertex_count) * 6, np.float32)),
+            "frame_items": buffer(np.zeros(FRAME_ITEM_SIZE, np.uint8), struct_size=FRAME_ITEM_SIZE),
+            "frame_item_count": buffer(np.zeros(4, np.uint32)),
             "dl_di": buffer(np.zeros((self.width * self.height, 3), np.float32)),
             "texel_slots": buffer(texel_slots),
         }
@@ -198,6 +211,8 @@ class PSDR:
             "env_map_id": env_map_id,
             "photon_radius": float(photon_radius),
             "max_relative_vertex_derivative": float(vertex_grad_clamp) / self._scene_extent,
+            "frame_limit_scale": float(self._scene_extent),
+            "frame_item_capacity": 0,
             "check_visibility": check_visibility,
             "light_tracing": False,
             "light_derivatives": False,
@@ -319,6 +334,9 @@ class PSDR:
         if self._buffers["vertex_grad"].size < n * 12:
             self._buffers["vertex_tangent"] = self._buffer(np.zeros((n, 3), np.float32))
             self._buffers["vertex_grad"] = self._buffer(np.zeros(n * 3, np.float32))
+            self._buffers["frame_tangent"] = self._buffer(np.zeros((2 * n, 3), np.float32))
+            self._buffers["frame_grad"] = self._buffer(np.zeros(n * 6, np.float32))
+            self._frame_tangents = False
         self._topology = {}
         self._vertex_query = None
 
@@ -403,14 +421,26 @@ class PSDR:
             table[index] = first
         return table
 
-    def set_tangents(self, vertex: Optional[np.ndarray] = None, params: Optional[np.ndarray] = None):
-        """Forward-mode direction: object-space vertex tangents (V, 3) and parameter tangents (P,)."""
+    def set_tangents(self, vertex: Optional[np.ndarray] = None, params: Optional[np.ndarray] = None,
+                     normals: Optional[np.ndarray] = None, frame_tangents: Optional[np.ndarray] = None):
+        """Forward-mode direction: object-space vertex tangents (V, 3) and parameter tangents (P,); ``normals`` and
+        ``frame_tangents`` (V, 3): those of the stored vertex normals and shading tangents (see frame_gradients()),
+        e.g. the derivatives of recomputed normals along ``vertex``. Without them (None), shading frames are constant."""
         vertex = np.zeros((self.vertex_count, 3)) if vertex is None else np.asarray(vertex)
         params = np.zeros(self.param_count) if params is None else np.asarray(params)
         if vertex.shape != (self.vertex_count, 3) or params.shape != (self.param_count,):
             raise ValueError("Tangent shapes must be (vertex_count, 3) and (param_count,)")
         self._buffers["vertex_tangent"].copy_from_numpy(np.ascontiguousarray(vertex, np.float32))
         self._buffers["param_tangent"].copy_from_numpy(np.ascontiguousarray(params, np.float32))
+        self._frame_tangents = normals is not None or frame_tangents is not None
+        if self._frame_tangents:
+            frame = np.zeros((self.vertex_count, 2, 3), np.float32)
+            for k, value in enumerate((normals, frame_tangents)):
+                if value is not None:
+                    if np.shape(value) != (self.vertex_count, 3):
+                        raise ValueError("Frame tangent shapes must be (vertex_count, 3)")
+                    frame[:, k] = value
+            self._buffers["frame_tangent"].copy_from_numpy(frame.reshape(-1, 3))
 
     # ------------------------------------------------------------------
     # Rendering
@@ -423,7 +453,11 @@ class PSDR:
         first vertex samples a glossy reflection is averaged with a path whose sample there is turned by half a
         turn about the lobe (interior term and primal image). False turns it off.
         """
-        self._run(False, spp, seed, terms, antithetic)
+        self._frame_derivatives = self._frame_tangents
+        try:
+            self._run(False, spp, seed, terms, antithetic)
+        finally:
+            self._frame_derivatives = False
         images = {"primal": self._image("primal")}
         for term, name in zip(TERMS, ("interior", "pixel_boundary", "primary_boundary", "secondary_boundary")):
             images[term] = self._image(name) if term in terms else np.zeros_like(images["primal"])
@@ -433,7 +467,8 @@ class PSDR:
         return images
 
     def backward(self, dl_di: np.ndarray, spp: int = 1, seed: int = 0, terms=TERMS, antithetic=True,
-                 accumulate: bool = False, normal_map_derivatives: Optional[bool] = None):
+                 accumulate: bool = False, normal_map_derivatives: Optional[bool] = None,
+                 frame_gradients: bool = False):
         """Gradients (vertex (V, 3), params (P,)) of L given dL/dI (H, W, 3); ``antithetic`` as in forward().
 
         ``accumulate``: the pass's gradients stay on the GPU, added to those of the previous accumulate passes, and
@@ -442,16 +477,29 @@ class PSDR:
 
         ``normal_map_derivatives``: False differentiates with constant shading frames, i.e. without the gradients of
         normal map texels and normal_texture_scale (zero); None (default) or True: with them whenever the scene has
-        normal maps. (A run-time switch of the same kernels.)"""
+        normal maps. (A run-time switch of the same kernels.)
+
+        ``frame_gradients``: also the gradients of the stored vertex normals and shading tangents, which the shading
+        frames interpolate (read with frame_gradients()). The vertex gradients hold them fixed: where normals and
+        tangents are recomputed from the positions (e.g. smooth shading after a vertex update), the full vertex
+        gradient adds the frame gradients chained through that computation. False (default): constant stored frames.
+        Needs split_interior (the default)."""
         if self._grads_pending and not accumulate:
             raise RuntimeError("Accumulated gradients unread: call gradients() first")
+        if frame_gradients and not self.split_interior and "interior" in terms:
+            raise ValueError("frame_gradients needs split_interior")
         dl_di = np.ascontiguousarray(dl_di, np.float32).reshape(-1, 3)
         self._buffers["dl_di"].copy_from_numpy(dl_di)
         self.normal_map_derivatives = normal_map_derivatives
+        self._frame_derivatives = bool(frame_gradients)
+        if not self._grads_pending:
+            self._frame_grads_pending = False
+        self._frame_grads_pending |= self._frame_derivatives
         try:
             self._run(True, spp, seed, terms, antithetic, clear_gradients=not self._grads_pending)
         finally:
             self.normal_map_derivatives = None
+            self._frame_derivatives = False
         if accumulate:
             self._grads_pending = True
             return None
@@ -463,9 +511,19 @@ class PSDR:
         self._grads_pending = False
         return self._read_gradients()
 
+    def frame_gradients(self):
+        """Gradients (normals (V, 3), tangents (V, 3)) of the stored object-space vertex normals and shading tangents
+        that the last backward() (with frame_gradients) or gradients() returned with, or None."""
+        return self._frame_grads
+
     def _read_gradients(self):
         vertex = self._buffers["vertex_grad"].to_numpy().view(np.float32)[: 3 * self.vertex_count]
         params = self._buffers["param_grad"].to_numpy().view(np.float32)[: self.param_count]
+        self._frame_grads = None
+        if self._frame_grads_pending:
+            frame = self._buffers["frame_grad"].to_numpy().view(np.float32)[: 6 * self.vertex_count].reshape(-1, 2, 3)
+            self._frame_grads = frame[:, 0], frame[:, 1]
+            self._frame_grads_pending = False
         return vertex.reshape(-1, 3), params  # views of fresh readback arrays (no copy)
 
     def _run(self, backward: bool, spp: int, seed: int, terms, antithetic, clear_gradients: bool = True):
@@ -481,7 +539,7 @@ class PSDR:
         names = ["primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
                  "light_interior"]
         if backward and clear_gradients:  # only backward passes write them (forward ones keep accumulated gradients)
-            names += ["vertex_grad", "param_grad"]
+            names += ["vertex_grad", "param_grad", "frame_grad"]
         encoder = self.device.create_command_encoder()
         for name in names:
             encoder.clear_buffer(self._buffers[name])
@@ -573,6 +631,7 @@ class PSDR:
         if split:
             kernels.append(("record_interior", (True,), dict(tid=pixel, spp=1, first=0, row0=0, rows=1, antithetic=True)))
             kernels.append(("backward_vertices", (True,), dict(tid=thread)))
+            kernels.append(("backward_frames", (True,), dict(tid=thread)))
         if light_tracing:
             kernels.append(("render_light", (False,) if merged else (False, True),
                             dict(tid=thread, tid0=0, count=0, frame=0)))
@@ -585,7 +644,8 @@ class PSDR:
         # No primary edge samples; photon sampling reads the (padded) first edge of the edge buffer.
         overrides = {"primary_edge_count": 0, "photon_edge_count": max(1, len(getattr(self, "_photon", ())))}
         outputs = ["primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
-                   "light_interior", "vertex_grad", "param_grad", "vertex_item_count"]
+                   "light_interior", "vertex_grad", "param_grad", "frame_grad", "vertex_item_count",
+                   "frame_item_count"]
         dispatches = [(name, backward, kwargs) for name, modes, kwargs in kernels for backward in modes
                       if names is None or name in names]
         # Largest programs first (a command list compiles as long as its slowest program; their sizes in inlined HLSL
@@ -607,6 +667,9 @@ class PSDR:
         paths' surface vertices as work items, backward_vertices() differentiates one per thread. Chunks are sized so
         that their items fit the item buffer even if every path has the maximum length."""
         capacity = self._vertex_item_buffers()
+        frames = self._frame_derivatives
+        if frames:
+            self._frame_item_buffers(capacity)
         per_row = self.width * 2 * (self.max_bounces + 1)  # items of a row of pixel samples at most
         # One record slot per thread (pixel sample).
         rows = max(1, min(self.height, capacity // per_row, self._path_rows()))
@@ -619,6 +682,7 @@ class PSDR:
                 n = min(rows, self.height - row0)
                 encoder = self.device.create_command_encoder()
                 encoder.clear_buffer(self._buffers["vertex_item_count"])
+                encoder.clear_buffer(self._buffers["frame_item_count"])
                 self.device.submit_command_buffer(encoder.finish())
                 self._call("record_interior", True, seed, tid=spy.grid((count * n, self.width)), spp=spp, first=first,
                            row0=row0, rows=n, antithetic=antithetic)
@@ -628,6 +692,10 @@ class PSDR:
                     if written > capacity:
                         raise RuntimeError(f"vertex item buffer overflow: {written} > {capacity}")
                 self._call("backward_vertices", True, seed, tid=spy.grid((min(capacity, count * n * per_row),)))
+                if frames:
+                    # The frame adjoints of these vertices, chained to the stored normals and tangents (see
+                    # backward_frames(): not in the vertex kernels).
+                    self._call("backward_frames", True, seed, tid=spy.grid((min(capacity, count * n * per_row),)))
 
     def _path_rows(self) -> int:
         """Rows of pixels per dispatch of the kernels that record camera paths, one record slot per pixel sample: the
@@ -666,6 +734,14 @@ class PSDR:
             self._globals["vertex_item_capacity"] = capacity
         return self._globals["vertex_item_capacity"]
 
+    def _frame_item_buffers(self, capacity: int):
+        """The frame items of the backward frame gradients (allocated on first use): one per vertex item at most."""
+        if self._globals["frame_item_capacity"] < capacity:
+            self._buffers["frame_items"] = self.device.create_buffer(
+                size=capacity * FRAME_ITEM_SIZE, struct_size=FRAME_ITEM_SIZE,
+                usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
+            self._globals["frame_item_capacity"] = capacity
+
     def _kernel(self, name: str, backward: bool):
         if (name, backward) not in self._kernels:
             self._kernels[name, backward] = self._query(name, backward)
@@ -687,6 +763,7 @@ class PSDR:
             if self._photon_accel is not None:
                 cursor["photon_tlas"] = self._photon_accel[2]
             cursor["normal_maps"] = self._normal_map_kernels()
+            cursor["frame_derivatives"] = self._frame_derivatives
             for key, value in (overrides or {}).items():
                 cursor[key] = value
 
