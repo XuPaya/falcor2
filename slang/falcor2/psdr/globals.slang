@@ -35,8 +35,6 @@ public uint photon_count;
 static float vertex_derivative_limit = 0.0;
 /// Link-time constant selecting backward or forward mode, so each kernel contains one of them.
 public extern static const bool backward;
-/// Use inline traversal when available; otherwise the tracing entry points run as ray-generation shaders.
-public extern static const bool USE_RAY_QUERY = true;
 // Keep absent reverse-mode material implementations out of Vulkan programs.
 public extern static const bool HAS_STANDARD_MATERIAL = true;
 public extern static const bool HAS_OPENPBR_MATERIAL = true;

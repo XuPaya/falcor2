@@ -222,37 +222,15 @@ bool russian_roulette(uint depth, inout float3 throughput, inout UniformSampleGe
     return true;
 }
 
-/// Closest hit along a ray with the scene's opacity evaluation (falcor2's RayQuerySceneIntersector for triangles; the
-/// reference path tracer's any-hit shader evaluates the same opacity per candidate).
-bool intersect_opacity(Ray ray, OpacityEvaluator opacity, out TriangleHitInfo hit)
+/// Closest hit along a ray with the scene's opacity evaluation (see IPsdrTraversal.closest_opacity).
+bool intersect_opacity(Ray ray, uint opacity_seed, out TriangleHitInfo hit)
 {
-    if (!USE_RAY_QUERY)
-        return trace_scene_closest(ray.to_ray_desc(), opacity, OpacityEvaluator.RAY_FLAGS, hit);
-    hit = TriangleHitInfo(GeometryInstanceID(0), 0, float2(0));
-    RayQuery<OpacityEvaluator.RAY_FLAGS> q;
-    q.TraceRayInline(g_scene.tlas, 0, 0xff, ray.to_ray_desc());
-    while (q.Proceed()) {
-        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            TriangleHitInfo candidate = TriangleHitInfo(
-                GeometryInstanceID(q.CandidateInstanceID() + q.CandidateGeometryIndex()), q.CandidatePrimitiveIndex(),
-                q.CandidateTriangleBarycentrics());
-            if (opacity.is_valid_hit(ray, candidate, SHADING_HINTS))
-                q.CommitNonOpaqueTriangleHit();
-        }
-    }
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-        return false;
-    hit = TriangleHitInfo(GeometryInstanceID(q.CommittedInstanceID() + q.CommittedGeometryIndex()),
-                          q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
-    return true;
+    return SceneTraversal.closest_opacity(ray, opacity_seed, hit);
 }
 
-bool occluded_opacity(Ray ray, OpacityEvaluator opacity)
+bool occluded_opacity(Ray ray, uint opacity_seed)
 {
-    if (!USE_RAY_QUERY)
-        return !trace_scene_visible(ray.to_ray_desc(), opacity, OpacityEvaluator.RAY_FLAGS);
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector(opacity);
-    return intersector.is_occluded(ray, SHADING_HINTS);
+    return SceneTraversal.occluded_opacity(ray, opacity_seed);
 }
 
 /// Visibility ray towards a light sample (the reference path tracer's create_visibility_ray()).
@@ -433,9 +411,8 @@ bool trace_path(Ray ray0, uint slot, inout UniformSampleGenerator sg, out PathRe
                 volume_event = true;
             }
         }
-        OpacityEvaluator opacity = OpacityEvaluator(sg.next_uint());
         TriangleHitInfo hit;
-        if (!intersect_opacity(ray, opacity, hit)) {
+        if (!intersect_opacity(ray, sg.next_uint(), hit)) {
             if (volume_event) {
                 // handle_volume_event(): a scattering vertex in the medium.
                 const HomogeneousMediumProperties medium = interiors.active_medium();
@@ -650,8 +627,8 @@ bool trace_path(Ray ray0, uint slot, inout UniformSampleGenerator sg, out PathRe
             LightSampleContext ctx = hemisphere_light_context(si, sampled_hemispheres);
             if (light_sampler.sample(ctx, sg, ls)
                 && in_sampled_hemispheres(si.front_facing ? si.normal_ws : -si.normal_ws, sampled_hemispheres, ls.dir_ws)) {
-                OpacityEvaluator shadow_opacity = OpacityEvaluator(sg.next_uint());
-                if (!occluded_opacity(light_visibility_ray(si, ls), shadow_opacity)) {
+                uint shadow_opacity_seed = sg.next_uint();
+                if (!occluded_opacity(light_visibility_ray(si, ls), shadow_opacity_seed)) {
                     nee = true;
                     nee_ls = ls;
                     if (light_tracing)

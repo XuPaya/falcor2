@@ -11,7 +11,8 @@
 // that shading frames interpolate): forward mode reads tangents and returns image derivatives, backward mode
 // atomically accumulates gradients.
 //
-// The module's files: globals.slang (shader parameters), parameters.slang and geometry.slang (differentiable
+// The module's files: globals.slang (shader parameters), traversal.slang (inline or ray-tracing-pipeline scene
+// traversal, a link-time type), parameters.slang and geometry.slang (differentiable
 // scene access), materials.slang and openpbr.slang (BSDFs), lights.slang, paths.slang (path records and the
 // terms of their vertices), a file per term (interior.slang, also the primal image, pixel_boundary.slang,
 // primary.slang and secondary.slang, with boundary.slang shared by the boundary terms), light_paths.slang (light
@@ -23,7 +24,7 @@ import falcor2.render;
 import falcor2.utils;
 
 __include "globals.slang";
-__include "ray_tracing.slang";
+__include "traversal.slang";
 __include "parameters.slang";
 __include "geometry.slang";
 __include "materials.slang";

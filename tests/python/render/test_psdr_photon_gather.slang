@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import falcor2.psdr.psdr;
+// Exported so the generated kernel module sees IPsdrTraversal and PipelineTraversal for its SceneTraversal export.
+__exported import falcor2.psdr.psdr;
 
 RWStructuredBuffer<uint> result_indices;
 RWStructuredBuffer<float> result_distances;

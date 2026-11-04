@@ -188,3 +188,31 @@ def test_trace_ray_opacity_in_shadow_rays(device_type):
     psdr.update(geometry=False)
     blocked = psdr.forward(spp=1, seed=3, terms=())["primal"]
     np.testing.assert_array_equal(blocked, 0)
+
+
+@pytest.mark.parametrize("device_type", DEVICE_TYPES)
+def test_traversals_match(device_type):
+    """Inline ray queries and the TraceRay pipeline both compile where the device supports them (TraceRay must stay
+    out of the inline programs' compute kernels: HLSL rejects it there, E36107) and agree on every term."""
+    device = helpers.get_device(device_type, floating_point_mode=spy.SlangFloatingPointMode.precise)
+    if not (device.has_feature(spy.Feature.ray_query) and device.has_feature(spy.Feature.ray_tracing)):
+        pytest.skip("Inline ray queries and a ray-tracing pipeline are required")
+    scene, camera, box, _ = small_scene(device)
+    x = np.linspace(0.2, 1.0, camera.width, dtype=np.float32)[None, :, None]
+    adjoint = np.broadcast_to(x, (camera.height, camera.width, 3)).copy()
+    results = {}
+    for traversal in ("ray_query", "trace_ray"):
+        psdr = PSDR(device, scene, camera, max_bounces=2, photon_radius=0.05, photon_count=4096,
+                    check_visibility=True, light_sampler=f2.UniformLightSampler(), traversal=traversal)
+        image = psdr.forward(spp=4, seed=7, terms=(), antithetic=False)["primal"]
+        grads = {term: psdr.backward(adjoint, spp=4, seed=17, terms=(term,), antithetic=False) for term in TERMS}
+        results[traversal] = image, grads, psdr.vertex_range(box)
+    (image, grads, box_range), (other, other_grads, _) = results["ray_query"], results["trace_ray"]
+    assert np.isfinite(image).all() and image.max() > 0
+    np.testing.assert_allclose(image, other, rtol=2e-5, atol=2e-6)
+    for term in TERMS:
+        for a, b in zip(grads[term], other_grads[term]):
+            assert np.isfinite(a).all() and np.isfinite(b).all(), term
+            # Float atomics accumulate in a different order.
+            assert np.linalg.norm(a - b) <= 1e-3 * max(np.linalg.norm(a), 1e-12), term
+        assert np.linalg.norm(grads[term][0][box_range]) > 0, term

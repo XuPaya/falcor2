@@ -74,6 +74,8 @@ class PSDR:
 
     ``traversal``: "auto" uses inline ray queries when available and a TraceRay pipeline otherwise.
     "ray_query" or "trace_ray" explicitly selects a supported implementation, for comparisons and debugging.
+    Supported backends are D3D12 on Windows and Vulkan on Linux; Vulkan on Windows has known failures (see
+    docs/psdr-platforms.md).
 
     ``vertex_grad_clamp`` (default VERTEX_GRAD_CLAMP; 0: off): backward mode bounds each path sample's interior-term
     vertex gradient to vertex_grad_clamp / scene extent x its dL/dI-weighted contribution. Sharp glossy lobes make
@@ -128,8 +130,11 @@ class PSDR:
         self._light_sampler = light_sampler or f2.PowerLightSampler()
         # Query kernels share programs across scenes. Pipeline kernels specialize derivative material families
         # so absent reverse-mode implementations do not enter the Vulkan program.
-        prelude = light_sampler_prelude(self._light_sampler)
         use_ray_query = traversal == "ray_query"
+        # The scene traversal is a link-time type (traversal.slang), so programs contain TraceRay only with trace_ray.
+        prelude = light_sampler_prelude(self._light_sampler) + (
+            f"export struct SceneTraversal : IPsdrTraversal = "
+            f"{'InlineTraversal' if use_ray_query else 'PipelineTraversal'};\n")
         materials = list(scene.materials)
         self._material_types = frozenset(m.slang_type_name for m in materials)
         # Keep the large reverse-mode BSDF implementations in separate Vulkan programs when all are present.
@@ -154,7 +159,7 @@ class PSDR:
             rt_setup = f2.SceneRayTracingSetup.create(scene, ray_descs)
 
         def query(name, backward=False, family=None, include_shared=True):
-            constants = {"backward": backward, "USE_RAY_QUERY": use_ray_query, **material_constants}
+            constants = {"backward": backward, **material_constants}
             if family is not None:
                 constants.update(BACKWARD_MATERIAL_FAMILY=family, INCLUDE_SHARED_DERIVATIVES=include_shared)
             tracing = rt_setup is not None and name in TRACING_KERNELS

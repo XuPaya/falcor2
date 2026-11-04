@@ -280,25 +280,8 @@ public void psdr_photon_miss(inout PhotonPayload payload)
 /// Gathers up to 16 photons on silhouette edges closest to the segment.
 public Neighbors gather(float3 origin, float3 dir, float t_max)
 {
-    Neighbors knn = {};
     RayDesc ray = { origin, ray_epsilon, dir, t_max - ray_epsilon };
-    if (USE_RAY_QUERY) {
-        RayQuery<RAY_FLAG_NONE> q;
-        q.TraceRayInline(photon_tlas, RAY_FLAG_NONE, 0xff, ray);
-        while (q.Proceed()) {
-            if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE)
-                continue;
-            uint i = q.CandidatePrimitiveIndex();
-            float dist, t_center;
-            if (photon_candidate(i, origin, dir, ray.TMin, ray.TMax, dist, t_center))
-                insert_neighbor(knn, i, dist);
-        }
-        return knn;
-    }
-    PhotonPayload payload = {};
-    TraceRay(photon_tlas, RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff,
-             PHOTON_HIT_GROUP_INDEX, 0, PHOTON_MISS_INDEX, ray, payload);
-    return payload.neighbors;
+    return SceneTraversal.gather_photons(ray);
 }
 
 /// Photon estimate on one path segment. `weight` is the detached path throughput through it.

@@ -61,7 +61,8 @@ def test_trace_ray_gather_nearest_unique_photons(device_type):
         cursor["result_distances"] = distances
 
     function = module.probe_photon_gather
-    function = function.constants({"USE_RAY_QUERY": False, "PHOTON_HIT_GROUP_INDEX": 0, "PHOTON_MISS_INDEX": 0})
+    function = function.constants({"PHOTON_HIT_GROUP_INDEX": 0, "PHOTON_MISS_INDEX": 0})
+    function = function.prelude("export struct SceneTraversal : IPsdrTraversal = PipelineTraversal;\n")
     function = function.write(bind)
     function = function.ray_tracing(
         hit_groups=[{"hit_group_name": "photons", "intersection_entry_point": "psdr_photon_intersection",

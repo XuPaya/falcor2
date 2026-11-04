@@ -229,10 +229,10 @@ LightConnection connect_to_camera(LightVertex v, float3 beta, uint depth, Interi
     if (!(t_max > 0.0))
         return c;
     Ray camera_ray = Ray(camera.position, to_target / t_max, 0.0, t_max);
-    OpacityEvaluator opacity = OpacityEvaluator(sg.next_uint());
-    if (!opacity.is_valid_hit(camera_ray, v.hit, SHADING_HINTS))
+    uint opacity_seed = sg.next_uint();
+    if (!OpacityEvaluator(opacity_seed).is_valid_hit(camera_ray, v.hit, SHADING_HINTS))
         return c;
-    if (occluded_opacity(camera_ray, opacity))
+    if (occluded_opacity(camera_ray, opacity_seed))
         return c;
 
     const float3 contribution = beta * eval.value * (abs(cos_geom_camera) / cos_geom_light) * importance * weight
@@ -318,9 +318,8 @@ void trace_light_path(uint tid, uint count, uint frame, uint slot)
 
     [loop]
     while (depth < max_vertices) {
-        OpacityEvaluator opacity = OpacityEvaluator(sg.next_uint());
         TriangleHitInfo hit;
-        if (!intersect_opacity(ray, opacity, hit))
+        if (!intersect_opacity(ray, sg.next_uint(), hit))
             break;
 
         LightVertex v;
