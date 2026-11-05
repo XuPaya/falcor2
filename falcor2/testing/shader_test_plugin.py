@@ -224,13 +224,16 @@ def _generate_dispatcher_source(func_names: list[str]) -> str:
     cases = "\n".join(f"        case {i}: {name}(); break;" for i, name in enumerate(func_names))
     return (
         f"\n// Auto-generated dispatcher entry point\n"
-        f"uniform uint _test_case_index;\n"
+        # CUDA emits an invalid __ldg() from constant memory for a bare uniform scalar.
+        # An explicit constant buffer keeps the dispatcher index valid on every backend.
+        f"struct TestCaseParams {{ uint index; }};\n"
+        f"ConstantBuffer<TestCaseParams> _test_case;\n"
         f'[shader("compute")]\n'
         f"[numthreads(1, 1, 1)]\n"
         f"void {_DISPATCHER_ENTRY_POINT}("
         f"uint3 _tid: SV_DispatchThreadID)\n"
         f"{{\n"
-        f"    switch (_test_case_index)\n"
+        f"    switch (_test_case.index)\n"
         f"    {{\n"
         f"{cases}\n"
         f"    }}\n"
@@ -338,7 +341,7 @@ def run_shader_test_batched(
         device,
         cached.kernel,
         _strip_test_prefix(func_names[test_case_index]),
-        extra_vars={"_test_case_index": test_case_index},
+        extra_vars={"_test_case": {"index": test_case_index}},
     )
 
 
