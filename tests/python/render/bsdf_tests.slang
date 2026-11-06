@@ -221,6 +221,13 @@ public float4 test_pbrt_dielectric_transmission_scaling(PBRTDielectricBSDF smoot
     return float4(smooth_valid && rough_valid ? 1.0 : 0.0, smooth_sample.weight.x, sample_scale, eval_scale);
 }
 
+/// Absolute error below 1, relative error above: retroreflected directions round differently,
+/// and values of several units differ by a few float32 ULPs (more than 1e-6 absolute).
+float retroreflection_error(float3 regular, float3 retroreflective)
+{
+    return mtlx::mx_hmax(abs(regular - retroreflective)) / max(mtlx::mx_hmax(abs(regular)), 1.0);
+}
+
 float4 test_mtlx_retroreflection_eval_pdf<B : IBSDF>(B regular, B retroreflective)
 {
     const float3 wi = normalize(float3(0.3, 0.2, 0.9));
@@ -236,7 +243,7 @@ float4 test_mtlx_retroreflection_eval_pdf<B : IBSDF>(B regular, B retroreflectiv
     const float retroreflective_pdf = retroreflective.eval_pdf(wi, wo, bc);
 
     return float4(
-        mtlx::mx_hmax(abs(regular_eval - retroreflective_eval)),
+        retroreflection_error(regular_eval, retroreflective_eval),
         abs(regular_pdf - retroreflective_pdf),
         regular_pdf,
         retroreflective_pdf
@@ -272,14 +279,14 @@ float4 test_mtlx_retroreflection_sample<B : IBSDF>(B regular, B retroreflective)
         direction_error = max(direction_error, length(expected_wo - retroreflective_sample.wo));
         pdf_error = max(pdf_error, abs(regular_sample.pdf - retroreflective_sample.pdf));
         weight_and_eval_error
-            = max(weight_and_eval_error, mtlx::mx_hmax(abs(regular_sample.weight - retroreflective_sample.weight)));
+            = max(weight_and_eval_error, retroreflection_error(regular_sample.weight, retroreflective_sample.weight));
 
         UniformSampleGenerator regular_eval_sg = UniformSampleGenerator(seed);
         UniformSampleGenerator retroreflective_eval_sg = UniformSampleGenerator(seed);
         const float3 regular_eval = regular.eval(wi, regular_sample.wo, regular_eval_sg, bc);
         const float3 retroreflective_eval
             = retroreflective.eval(wi, retroreflective_sample.wo, retroreflective_eval_sg, bc);
-        weight_and_eval_error = max(weight_and_eval_error, mtlx::mx_hmax(abs(regular_eval - retroreflective_eval)));
+        weight_and_eval_error = max(weight_and_eval_error, retroreflection_error(regular_eval, retroreflective_eval));
         pdf_error = max(
             pdf_error,
             abs(regular.eval_pdf(wi, regular_sample.wo, bc)

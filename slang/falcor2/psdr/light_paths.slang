@@ -229,10 +229,10 @@ LightConnection connect_to_camera(LightVertex v, float3 beta, uint depth, Interi
     if (!(t_max > 0.0))
         return c;
     Ray camera_ray = Ray(camera.position, to_target / t_max, 0.0, t_max);
-    OpacityEvaluator opacity = OpacityEvaluator(sg.next_uint());
-    if (!opacity.is_valid_hit(camera_ray, v.hit, SHADING_HINTS))
+    uint opacity_seed = sg.next_uint();
+    if (!OpacityEvaluator(opacity_seed).is_valid_hit(camera_ray, v.hit, SHADING_HINTS))
         return c;
-    if (occluded_opacity(camera_ray, opacity))
+    if (occluded_opacity(camera_ray, opacity_seed))
         return c;
 
     const float3 contribution = beta * eval.value * (abs(cos_geom_camera) / cos_geom_light) * importance * weight
@@ -318,9 +318,8 @@ void trace_light_path(uint tid, uint count, uint frame, uint slot)
 
     [loop]
     while (depth < max_vertices) {
-        OpacityEvaluator opacity = OpacityEvaluator(sg.next_uint());
         TriangleHitInfo hit;
-        if (!intersect_opacity(ray, opacity, hit))
+        if (!intersect_opacity(ray, sg.next_uint(), hit))
             break;
 
         LightVertex v;
@@ -475,19 +474,21 @@ void trace_light_path(uint tid, uint count, uint frame, uint slot)
         for (int k = int(n) - 1; k >= 0; k--) {
             const LightPathVertex lv = light_path_vertices[k * light_path_slots + slot];
             float3 a = lv.conn.connected ? dl_di[lv.conn.pixel] * lv.conn.value * light_sample_weight : float3(0.0);
-            [loop]
-            for (uint f = 0; f < 2; f++) {
-                if (f == 0 ? !(k + 1 < int(n) && any(suffix != 0.0) && any(lv.next_dir != 0.0)) : !lv.conn.connected)
-                    continue;
-                var theta = diffPair(0.0);
-                bwd_diff(light_path_factor)(theta, lv.hit, f == 0 ? lv.next_dir : lv.conn.dir, lv.to_light,
-                                            f == 0 ? lv.delta != 0 : false, f == 0 ? lv.next_ior : lv.conn.exterior_ior,
-                                            f == 0 ? suffix : a);
+            if (backward_material_hit(lv.hit)) {
+                [loop]
+                for (uint f = 0; f < 2; f++) {
+                    if (f == 0 ? !(k + 1 < int(n) && any(suffix != 0.0) && any(lv.next_dir != 0.0)) : !lv.conn.connected)
+                        continue;
+                    var theta = diffPair(0.0);
+                    bwd_diff(light_path_factor)(theta, lv.hit, f == 0 ? lv.next_dir : lv.conn.dir, lv.to_light,
+                                                f == 0 ? lv.delta != 0 : false, f == 0 ? lv.next_ior : lv.conn.exterior_ior,
+                                                f == 0 ? suffix : a);
+                }
             }
             if (lv.conn.connected)
                 suffix += a;
         }
-        if (any(suffix != 0.0)) {
+        if (INCLUDE_SHARED_DERIVATIVES && any(suffix != 0.0)) {
             var theta = diffPair(0.0);
             bwd_diff(light_emission_factor)(theta, uint(e.type), e.index, light_hit, e.dir_ws, emitted, suffix);
         }

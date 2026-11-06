@@ -34,14 +34,18 @@ def bumpy_patch(scene, x0, material, n=9):
     return add_mesh(scene, positions, faces, material)
 
 
-@pytest.fixture(scope="module", params=DEVICE_TYPES)
+@pytest.fixture(scope="module", params=[(device_type, traversal) for device_type in DEVICE_TYPES
+                                       for traversal in ("ray_query", "trace_ray")],
+                ids=lambda value: f"{value[0].name}-{value[1]}")
 def patches(request):
     # Use production-style shader code: debug metadata makes DXC's generated AD kernels much larger.
     # Keep precise arithmetic and the device's validation layers enabled.
-    device = helpers.get_device(request.param, floating_point_mode=spy.SlangFloatingPointMode.precise,
+    device_type, traversal = request.param
+    device = helpers.get_device(device_type, floating_point_mode=spy.SlangFloatingPointMode.precise,
                                 shader_debug_info=spy.SlangDebugInfoLevel.none)
-    if not device.has_feature(spy.Feature.ray_query):
-        pytest.skip("Inline ray queries are required")
+    feature = spy.Feature.ray_query if traversal == "ray_query" else spy.Feature.ray_tracing
+    if not device.has_feature(feature):
+        pytest.skip(f"{traversal} is required")
     scene = f2.Scene.create(device)
     instances = {}
     for k, (family, props) in enumerate(FAMILIES.items()):
@@ -52,7 +56,7 @@ def patches(request):
     camera = add_camera(scene, (0, 3, 0.4), (0, 0, 0), (0, 0, 1), 70, 24, 12)
     scene.update()
     psdr = PSDR(device, scene, camera, max_bounces=1, light_sampler=f2.UniformLightSampler(),
-                photon_count=256, vertex_grad_clamp=0)
+                photon_count=256, vertex_grad_clamp=0, traversal=traversal)
     adjoint = np.broadcast_to(np.linspace(0.2, 1, psdr.width, dtype=np.float32)[None, :, None],
                               (psdr.height, psdr.width, 3)).copy() / (psdr.width * psdr.height)
     return scene, instances, psdr, adjoint

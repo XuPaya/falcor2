@@ -61,6 +61,9 @@ DEVICE_CACHE: dict[
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 DEFAULT_MODULE_AND_SHADER_CACHE_DIR = PROJECT_ROOT / ".shader-cache" / "tests"
+# A full PSDR traversal/material matrix exceeds SGL's 128 MiB default. Keep the
+# persistent cache large enough to retain compiled programs for a fresh-process rerun.
+TEST_SHADER_CACHE_SIZE = 2 * 1024 * 1024 * 1024
 MODULE_CACHE_ENABLED = False
 SHADER_CACHE_ENABLED = False
 COMPILATION_REPORTS_ENABLED = False
@@ -276,6 +279,7 @@ def get_device(
         existing_device_handles=existing_device_handles,
         module_cache_path=module_cache_path,
         shader_cache_path=shader_cache_path,
+        shader_cache_size=TEST_SHADER_CACHE_SIZE,
         additional_vulkan_instance_extensions=additional_vulkan_instance_extensions,
         additional_vulkan_device_extensions=additional_vulkan_device_extensions,
         label=label,

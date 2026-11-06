@@ -188,52 +188,100 @@ float edge_weight(Vertex s, Vertex d, float3 dir, bool infinite, float3 xb, floa
     return j * g * photon_edge_length / 0.5;
 }
 
-struct Neighbors
+public struct Neighbors
 {
-    float dist[16];
-    uint index[16];
-    uint count;
-    float max_dist;
+    public float dist[16];
+    public uint index[16];
+    public uint count;
+    public float max_dist;
 };
 
-/// Gathers up to 16 photons on silhouette edges closest to the segment.
-Neighbors gather(float3 origin, float3 dir, float t_max)
+/// Test the same photon candidates for inline and pipeline traversal. The AABB traversal has already checked the
+/// segment against the photon's bounds; this filters by perpendicular distance and the edge's silhouette condition.
+bool photon_candidate(uint i, float3 origin, float3 dir, float t_min, float t_max, out float dist, out float t_center)
 {
-    Neighbors knn = {};
-    RayDesc ray = { origin, ray_epsilon, dir, t_max - ray_epsilon };
-    RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(photon_tlas, RAY_FLAG_NONE, 0xff, ray);
-    while (q.Proceed()) {
-        if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE)
-            continue;
-        uint i = q.CandidatePrimitiveIndex();
-        Photon photon = photons[i];
-        float3 oc = photon.position - origin;
-        float t_center = dot(oc, dir);
-        float3 perpendicular = oc - t_center * dir;
-        float dist = length(perpendicular);
-        if (dist > photon_radius || t_center + photon_radius < ray.TMin || t_center - photon_radius > ray.TMax)
-            continue;
-        if (photon.has_second_face != 0 && sign(dot(dir, photon.normal0)) * sign(dot(dir, photon.normal1)) > -0.5f)
-            continue;
-        if (knn.count < 16) {
-            knn.dist[knn.count] = dist;
-            knn.index[knn.count] = i;
-            knn.count++;
-            knn.max_dist = max(knn.max_dist, dist);
-        } else if (dist < knn.max_dist) {
-            uint worst = 0;
-            for (uint k = 1; k < 16; k++)
-                if (knn.dist[k] > knn.dist[worst])
-                    worst = k;
-            knn.dist[worst] = dist;
-            knn.index[worst] = i;
-            knn.max_dist = 0;
-            for (uint k = 0; k < 16; k++)
-                knn.max_dist = max(knn.max_dist, knn.dist[k]);
-        }
+    Photon photon = photons[i];
+    float3 oc = photon.position - origin;
+    t_center = dot(oc, dir);
+    dist = length(oc - t_center * dir);
+    if (dist > photon_radius || t_center + photon_radius < t_min || t_center - photon_radius > t_max)
+        return false;
+    if (photon.has_second_face != 0 && sign(dot(dir, photon.normal0)) * sign(dot(dir, photon.normal1)) > -0.5f)
+        return false;
+    return true;
+}
+
+void insert_neighbor(inout Neighbors knn, uint i, float dist)
+{
+    // A driver may invoke any-hit more than once for a primitive. Count a photon once, including when it has
+    // displaced a more distant photon; repeated visits to an evicted photon cannot improve the current set.
+    for (uint k = 0; k < knn.count; k++)
+        if (knn.index[k] == i)
+            return;
+    if (knn.count < 16) {
+        knn.dist[knn.count] = dist;
+        knn.index[knn.count] = i;
+        knn.count++;
+        knn.max_dist = max(knn.max_dist, dist);
+    } else if (dist < knn.max_dist) {
+        uint worst = 0;
+        for (uint k = 1; k < 16; k++)
+            if (knn.dist[k] > knn.dist[worst])
+                worst = k;
+        knn.dist[worst] = dist;
+        knn.index[worst] = i;
+        knn.max_dist = 0;
+        for (uint k = 0; k < 16; k++)
+            knn.max_dist = max(knn.max_dist, knn.dist[k]);
     }
-    return knn;
+}
+
+public extern static const uint PHOTON_HIT_GROUP_INDEX = 0;
+public extern static const uint PHOTON_MISS_INDEX = 0;
+
+[raypayload]
+public struct PhotonPayload
+{
+    public Neighbors neighbors : read(caller, anyhit) : write(caller, anyhit);
+};
+
+public struct PhotonHitAttributes
+{
+    public float dist;
+};
+
+[shader("intersection")]
+public void psdr_photon_intersection()
+{
+    float dist, t_center;
+    if (photon_candidate(PrimitiveIndex(), WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent(), dist,
+                         t_center)) {
+        PhotonHitAttributes attributes = { dist };
+        // This is a neighborhood query, not a sphere-surface intersection. Report a valid segment position so that
+        // any-hit can consume this candidate, including photons whose center lies just beyond an endpoint.
+        ReportHit(clamp(t_center, RayTMin(), RayTCurrent()), 0, attributes);
+    }
+}
+
+[shader("anyhit")]
+public void psdr_photon_any_hit(inout PhotonPayload payload, PhotonHitAttributes attributes)
+{
+    insert_neighbor(payload.neighbors, PrimitiveIndex(), attributes.dist);
+    // Never commit a photon: shortening the segment would omit candidates that are closer in perpendicular distance.
+    IgnoreHit();
+}
+
+[shader("miss")]
+public void psdr_photon_miss(inout PhotonPayload payload)
+{
+    // All candidates were ignored after gathering; preserve the accumulated neighbors.
+}
+
+/// Gathers up to 16 photons on silhouette edges closest to the segment.
+public Neighbors gather(float3 origin, float3 dir, float t_max)
+{
+    RayDesc ray = { origin, ray_epsilon, dir, t_max - ray_epsilon };
+    return SceneTraversal.gather_photons(ray);
 }
 
 /// Photon estimate on one path segment. `weight` is the detached path throughput through it.

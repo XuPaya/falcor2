@@ -9,7 +9,7 @@ from weakref import ReferenceType, ref
 import slangpy as spy
 import falcor2 as f2
 
-from falcor2.editor.scene_shader import SceneShaderHelper
+from falcor2.editor.scene_shader import SceneShaderHelper, scene_ray_tracing
 from falcor2.editor.graph_settings import GraphSettingsPanel
 from falcor2.rendergraph import is_torch_tensor, torch_to_slangpy
 from falcor2.rendergraph.render_node import RenderNode
@@ -139,6 +139,8 @@ class Editor:
         # Scene shader helper for debug modes
         self._scene_shader: Optional[SceneShaderHelper] = None
         self._viewer_module = None
+        self._traced_debug_function: Any = None
+        self._traced_debug_key: Any = None
         self._present_module = None
         self._mcp_bridge: Optional[Any] = None
 
@@ -453,12 +455,29 @@ class Editor:
         assert self._scene is not None
         assert self._camera is not None
 
+        if not self.device.has_feature(spy.Feature.ray_query):
+            self._get_traced_debug_function(self._scene)(
+                ray=self._camera,
+                render_mode=int(self._render_mode),
+                _result=self._output.color_target,
+            )
+            return
+
         self._get_viewer_function(self._scene, "render_debug_no_ids").dispatch(
             thread_count=spy.uint3(self._camera.width, self._camera.height, 1),
             camera=self._camera,
             render_mode=int(self._render_mode),
             color_output=self._output.color_target,
         )
+
+    def _get_traced_debug_function(self, scene: f2.Scene):
+        """render_debug_traced as a ray-generation shader, cached per scene and module (requirements)."""
+        key = (id(scene), self._get_scene_shader().get_module(scene, "falcor2.editor"))
+        if key != self._traced_debug_key:
+            function = self._get_viewer_function(scene, "render_debug_traced")
+            self._traced_debug_function = scene_ray_tracing(function, scene, "debug")
+            self._traced_debug_key = key
+        return self._traced_debug_function
 
     def _get_scene_shader(self) -> SceneShaderHelper:
         if self._scene_shader is None:

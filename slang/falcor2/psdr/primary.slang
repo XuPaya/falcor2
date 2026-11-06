@@ -25,7 +25,16 @@ public void render_primary(uint tid, uint samples)
     float3 xb = lerp(p[0], p[1], t);
     float3 d = normalize(xb - camera.position);
     float z = dot(d, camera_forward());
-    if (z <= 0 || !visible(camera.position, xb))
+    if (z <= 0)
+        return;
+    // Edge-plane normal, pointing away from the edge's faces (for a silhouette edge both lie on the other side).
+    float3 nb = normalize(cross(p[0] - p[1], d));
+    nb *= -sign(dot(nb, p[2] - p[0]));
+    // The rays below run along the edge's own faces at grazing angles. Float32 rounding can put xb just inside the
+    // occluder, and a hit on those faces then drops the sample (see docs/psdr-primary-edge-grazing-bias.md), so
+    // cast them from a point just off the occluder.
+    float3 xo = xb + nb * max(ray_epsilon, 1e-5 * max(length(xb), length(camera.position)));
+    if (!visible(camera.position, xo))
         return;
     float2 film = camera.project_world_to_pixel(xb);
     if (any(film < 0) || any(film >= float2(camera.dims)))
@@ -33,13 +42,11 @@ public void render_primary(uint tid, uint samples)
     uint index = uint(film.y) * camera.dims.x + uint(film.x);
     // The surface behind the edge, or the environment it hides.
     PathRecord rec;
-    trace_path(xb, d, NO_SLOT, sg, rec);
+    trace_path(xo, d, NO_SLOT, sg, rec);
     float3 value = rec.radiance;
     if (all(value == 0))
         return;
     Background b = background(rec, xb, d);
-    float3 nb = normalize(cross(p[0] - p[1], d));
-    nb *= -sign(dot(nb, p[2] - p[0]));
     float weight = sensor_importance(b.p) * boundary_factor(b.p, xb, normalize(p[0] - p[1]), b.n)
         * primary_edge_length / samples;
     float3 adjoint = backward ? dl_di[index] : float3(0);

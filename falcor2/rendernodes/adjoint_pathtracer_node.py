@@ -33,7 +33,7 @@ from slangpy import CommandEncoder, Device
 
 import falcor2 as f2
 from falcor2.editor.scene_shader import (SceneShaderHelper, bind_light_sampler, light_sampler_key,
-                                         light_sampler_prelude)
+                                         light_sampler_prelude, scene_ray_tracing)
 from falcor2.rendergraph import Container, ContainerSpec, RenderNode
 from falcor2.rendernodes.reference_pathtracer_node import ReferencePathTracerNode
 
@@ -198,16 +198,20 @@ class AdjointPathTracerNode(RenderNode):
     def _get_funcs(self, scene: f2.Scene) -> dict[str, Any]:
         module = self._scene_shader.get_module(scene, self._source_module)
         pt = self.path_tracer
+        use_ray_query = self._device.has_feature(spy.Feature.ray_query)
         constants = {
             "ENABLE_INTERIOR_TRACKING": pt.enable_interior_tracking,
             "ENABLE_HOMOGENEOUS_MEDIA": pt.enable_homogeneous_media,
             "ENABLE_RUSSIAN_ROULETTE": self._enable_russian_roulette,
         }
         sampler = pt.light_sampler
-        key = (module, tuple(sorted(constants.items())), light_sampler_key(sampler))
+        key = (module, use_ray_query, tuple(sorted(constants.items())), light_sampler_key(sampler))
         if key != self._funcs_key:
             conformances = scene.requirements.type_conformances
-            prelude = light_sampler_prelude(sampler)
+            # The traversal is a link-time type, so only trace_ray programs contain TraceRay.
+            traversal = "InlineAdjointTraversal" if use_ray_query else "PipelineAdjointTraversal"
+            prelude = (light_sampler_prelude(sampler)
+                       + f"export struct AdjointTraversal : IAdjointTraversal = {traversal};\n")
             self._funcs = {
                 name: getattr(module, name)
                 .constants(constants)
@@ -216,6 +220,10 @@ class AdjointPathTracerNode(RenderNode):
                 .write(self._scene_shader.bind_scene)
                 for name in ("trace_light_paths", "resolve", "clear_accumulation")
             }
+            if not use_ray_query:
+                self._funcs["trace_light_paths"] = scene_ray_tracing(
+                    self._funcs["trace_light_paths"], scene, "adjoint"
+                )
             self._funcs_key = key
         return self._funcs
 
@@ -241,6 +249,11 @@ class AdjointPathTracerNode(RenderNode):
         cmd: Optional[CommandEncoder] = None,
     ) -> tuple[Any, dict[str, Any | None]]:
         """Render one frame (one path-tracer sample per pixel + one light-tracer pass)."""
+        # Keep the path tracer, accumulation clear, light tracer and resolve in one
+        # submission. A caller-provided encoder remains owned by the caller.
+        owns_cmd = cmd is None
+        if owns_cmd:
+            cmd = self._device.create_command_encoder()
         width, height = int(camera.width), int(camera.height)
         output = self._get_output(camera)
         guides: dict[str, Any | None] = {}
@@ -319,4 +332,6 @@ class AdjointPathTracerNode(RenderNode):
             output=Container.to_render_layout(output),
             _append_to=cmd,
         )
+        if owns_cmd:
+            self._device.submit_command_buffer(cmd.finish())
         return output, guides

@@ -148,9 +148,10 @@ fits with an RGB term, pose fits with `rgb_weight > 0` (the toolkit poses by wri
 falcor2_inverse `MeshTransform` rotation / scale. Silhouette (mask) losses and material, texture and light
 gradients are unaffected.
 
-## Not covered
+## Limits of the original frame-gradient change
 
-- Light paths (light tracing) have no frame derivatives, as they have no geometric derivatives at all.
+- The original change covered camera paths. The subsequent Vulkan/D3D12 integration also differentiates light-path
+  frames; see [the integration report](psdr-dxc-merge.md).
 - `adjust_shading_normal()`'s grazing-angle blend (cos < 0.1) still uses the detached geometric normal and primal
   incident direction.
 - Forward mode through falcor2_inverse: it has none; PSDR callers pass the frame tangents themselves.
@@ -178,7 +179,7 @@ now take their hit directly from the original `VertexItem`, outside automatic di
 check the resulting reverse gradients against forward mode and finite differences for all three families, and check
 accumulation without changing sample counts or tolerances.
 
-Run the four cases on Windows with a new cache directory for a cold compilation measurement, then repeat the command
+Run the frame cases on Windows with a new cache directory for a cold compilation measurement, then repeat the command
 to measure cache reuse:
 
 ```powershell
@@ -187,8 +188,8 @@ $env:SLANGPY_DEVICE = "d3d12"
   --module-and-shader-cache-dir .shader-cache/psdr-frames-d3d12
 ```
 
-The optimized shader blobs fit the existing cache limits; increasing the native cache size is unnecessary for these
-tests. On Windows/D3D12 with an RTX A6000, all four cases passed in 455.06 seconds wall time with an empty module/shader
+The original four cases fit the 128 MiB cache. The integrated traversal/material matrix exceeds that capacity, so
+the Python test helper now allows 2 GiB. On Windows/D3D12 with an RTX A6000, the original four cases passed in 455.06 seconds wall time with an empty module/shader
 cache, including process startup and compilation. A fresh process reusing that cache passed in 9.23 seconds, with all
 19 shader and pipeline entries reported as cache hits. These are measurements on that machine, not a time guarantee
 for other hardware or compiler versions.
@@ -196,7 +197,7 @@ for other hardware or compiler versions.
 `tests/python/render/test_psdr_material_dispatch.py` additionally checks fallback-material dispatch and shared
 point/environment light gradients against finite differences before and after material reassignment.
 
-### Full D3D12 validation and related numerical fix
+### Historical D3D12 validation and related numerical fix
 
 The full rerun used the repository's `.venv` on an RTX A6000, including slow and image tests. All 603 applicable
 native tests and all 21 PSDR tests passed. The Python run recorded 1,296 passes, three failures, 19 skips, and two
@@ -208,7 +209,8 @@ Commit `274a865` fixes the MXSheen numerical issue: Conty-Kulla sheen now comput
 half-vector's tangential components instead of subtracting its squared normal component from one. This avoids
 cancellation near the normal while retaining the existing consistency tolerance and default compiler arithmetic.
 Both new near-normal evaluation regressions failed before the change; all 12 targeted D3D12 sheen tests passed
-afterward. The full suite has not been repeated after that numerical fix, and the throughput failure remains open.
+afterward. These are pre-integration results; see [the integration report](psdr-dxc-merge.md) for the subsequent
+Windows D3D12/Vulkan validation.
 
 ## Files
 

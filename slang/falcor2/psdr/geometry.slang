@@ -123,9 +123,9 @@ Frame interpolated_frame(float theta, no_diff HitRef h, no_diff float handedness
 }
 
 /// Backward mode: the adjoint of the shading frame of the vertex being differentiated (vertex_shading_frame()) and its
-/// handedness. backward_vertices() adds the recorded hit and hands it to backward_frames(), which chains it to the
-/// stored vertex normals and tangents in a kernel of its own: in the BSDFs' reverse-mode kernels, that chain makes the
-/// SpongeCake kernel of a Vulkan material-family pass hang.
+/// handedness. backward_vertices() adds the original hit and hands it to backward_frames(), which chains it to the stored vertex normals and
+/// tangents in a kernel of its own: in the BSDFs' reverse-mode kernels, that chain makes the SpongeCake kernel of a
+/// Vulkan material-family pass hang.
 static Frame.Differential frame_adjoint;
 static float frame_handedness;
 static bool frame_pending = false;
@@ -163,15 +163,12 @@ bool intersect(float3 origin, float3 dir, float t_max, out HitRef h)
 {
     h = {};
     RayDesc ray = { origin, ray_epsilon, dir, t_max };
-    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-    q.TraceRayInline(g_scene.tlas, RAY_FLAG_NONE, 0xff, ray);
-    while (q.Proceed()) {}
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-        return false;
-    h.gid = GeometryInstanceID(q.CommittedInstanceID() + q.CommittedGeometryIndex());
-    h.prim = q.CommittedPrimitiveIndex();
-    h.bary = q.CommittedTriangleBarycentrics();
-    return true;
+    TriangleHitInfo hit;
+    bool found = SceneTraversal.closest_opaque(ray, hit);
+    h.gid = hit.geometry_instance_id;
+    h.prim = hit.primitive_index;
+    h.bary = hit.barycentrics;
+    return found;
 }
 
 bool visible(float3 a, float3 b)
@@ -181,8 +178,5 @@ bool visible(float3 a, float3 b)
     if (t <= 2 * ray_epsilon)
         return true;
     RayDesc ray = { a, ray_epsilon, d / t, t - ray_epsilon };
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-    q.TraceRayInline(g_scene.tlas, RAY_FLAG_NONE, 0xff, ray);
-    while (q.Proceed()) {}
-    return q.CommittedStatus() == COMMITTED_NOTHING;
+    return SceneTraversal.visible_opaque(ray);
 }

@@ -28,6 +28,82 @@ import falcor2.utils;
 
 import slangpy;
 
+#include "falcor2/render/scene_ray_tracing.slangh"
+
+/// Scene traversal of the light paths: the link-time type AdjointTraversal, which the node's prelude exports, so each
+/// program contains only one implementation. TraceRay is valid only in ray-tracing stages: behind a branch on a
+/// link-time constant it would remain in the inline compute kernel, which Slang rejects (E36107). The methods take the
+/// opacity evaluator's seed, not an OpacityEvaluator (another link-time type; see psdr/traversal.slang).
+public interface IAdjointTraversal
+{
+    public static IHitInfo intersect(Ray ray, uint opacity_seed);
+    public static bool is_occluded(Ray ray, uint opacity_seed);
+};
+
+/// Inline ray queries.
+public struct InlineAdjointTraversal : IAdjointTraversal
+{
+    public static IHitInfo intersect(Ray ray, uint opacity_seed)
+    {
+        RayQuerySceneIntersector intersector = RayQuerySceneIntersector(OpacityEvaluator(opacity_seed));
+        return intersector.intersect(ray, MaterialInstanceHints::adjust_shading_normal);
+    }
+
+    public static bool is_occluded(Ray ray, uint opacity_seed)
+    {
+        RayQuerySceneIntersector intersector = RayQuerySceneIntersector(OpacityEvaluator(opacity_seed));
+        return intersector.is_occluded(ray, MaterialInstanceHints::adjust_shading_normal);
+    }
+};
+
+/// Ray-tracing pipeline (devices without inline ray queries): trace_light_paths runs as a ray-generation shader.
+public struct PipelineAdjointTraversal : IAdjointTraversal
+{
+    public static IHitInfo intersect(Ray ray, uint opacity_seed)
+    {
+        return trace_adjoint_ray(ray, OpacityEvaluator(opacity_seed), 0).unpack();
+    }
+
+    public static bool is_occluded(Ray ray, uint opacity_seed)
+    {
+        return trace_adjoint_ray(ray, OpacityEvaluator(opacity_seed), RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH)
+            .unpack()
+            .valid;
+    }
+};
+
+public extern struct AdjointTraversal : IAdjointTraversal = InlineAdjointTraversal;
+
+struct AdjointHitPayload
+{
+    PackedHitInfo hit;
+    OpacityEvaluator opacity;
+};
+
+PackedHitInfo trace_adjoint_ray(Ray ray, OpacityEvaluator opacity, uint flags)
+{
+    AdjointHitPayload payload = { {}, opacity };
+    TraceRay(g_scene.tlas, OpacityEvaluator.RAY_FLAGS | flags, 0xff, 0, 0, 0, ray.to_ray_desc(), payload);
+    return payload.hit;
+}
+
+SCENE_RAY_TYPE_MISS(adjoint, adjoint_miss, AdjointHitPayload);
+void adjoint_miss(inout AdjointHitPayload payload) { payload.hit = {}; }
+
+SCENE_RAY_TYPE_CLOSEST_HIT(adjoint, adjoint_closest_hit, AdjointHitPayload);
+void adjoint_closest_hit<D : IDeferredHitInfo>(inout AdjointHitPayload payload, D deferred_hit)
+{
+    payload.hit = deferred_hit.create().pack();
+}
+
+SCENE_RAY_TYPE_ANY_HIT(adjoint, adjoint_any_hit, AdjointHitPayload);
+void adjoint_any_hit<D : IDeferredHitInfo>(inout AdjointHitPayload payload, D deferred_hit)
+{
+    Ray ray = Ray(WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent());
+    if (!payload.opacity.is_valid_hit(ray, deferred_hit.create(), MaterialInstanceHints::adjust_shading_normal))
+        IgnoreHit();
+}
+
 /// Track closed-surface interiors (mirrors the path tracer's constant).
 extern static const bool ENABLE_INTERIOR_TRACKING = true;
 /// Homogeneous media in tracked interiors (mirrors the path tracer's constant).
@@ -301,12 +377,11 @@ void connect_to_camera(
     if (!(t_max > 0.0))
         return;
     Ray camera_ray = Ray(camera.position, to_target / t_max, 0.0, t_max);
-    OpacityEvaluator opacity_evaluator = OpacityEvaluator(sg.next_uint());
+    const uint opacity_seed = sg.next_uint();
     // The vertex itself must be accepted by a camera ray (cut-outs).
-    if (!opacity_evaluator.is_valid_hit(camera_ray, hit, MaterialInstanceHints::adjust_shading_normal))
+    if (!OpacityEvaluator(opacity_seed).is_valid_hit(camera_ray, hit, MaterialInstanceHints::adjust_shading_normal))
         return;
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector(opacity_evaluator);
-    if (intersector.is_occluded(camera_ray, MaterialInstanceHints::adjust_shading_normal))
+    if (AdjointTraversal.is_occluded(camera_ray, opacity_seed))
         return;
 
     const float3 contribution = beta * eval.value * (abs(cos_geom_camera) / cos_geom_light) * importance * weight
@@ -360,9 +435,7 @@ public void trace_light_paths(uint tid)
     LightPathMIS mis = {};
 
     while (depth < max_vertices) {
-        OpacityEvaluator opacity_evaluator = OpacityEvaluator(sg.next_uint());
-        RayQuerySceneIntersector intersector = RayQuerySceneIntersector(opacity_evaluator);
-        const IHitInfo hit = intersector.intersect(ray, MaterialInstanceHints::adjust_shading_normal);
+        const IHitInfo hit = AdjointTraversal.intersect(ray, sg.next_uint());
         if (!hit.valid)
             break;
 

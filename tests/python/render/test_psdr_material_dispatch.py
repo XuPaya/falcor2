@@ -16,7 +16,7 @@ from .test_psdr_parity import DEVICE_TYPES
 from .test_psdr_shading_frames import bumpy_patch
 
 
-@pytest.mark.parametrize("device_type", [t for t in DEVICE_TYPES if t == spy.DeviceType.d3d12])
+@pytest.mark.parametrize("device_type", DEVICE_TYPES)
 def test_material_dispatch_preserves_light_gradients_after_reassignment(device_type, tmp_path):
     device = helpers.get_device(
         device_type,

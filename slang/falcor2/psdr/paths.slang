@@ -222,33 +222,15 @@ bool russian_roulette(uint depth, inout float3 throughput, inout UniformSampleGe
     return true;
 }
 
-/// Closest hit along a ray with the scene's opacity evaluation (falcor2's RayQuerySceneIntersector for triangles; the
-/// reference path tracer's any-hit shader evaluates the same opacity per candidate).
-bool intersect_opacity(Ray ray, OpacityEvaluator opacity, out TriangleHitInfo hit)
+/// Closest hit along a ray with the scene's opacity evaluation (see IPsdrTraversal.closest_opacity).
+bool intersect_opacity(Ray ray, uint opacity_seed, out TriangleHitInfo hit)
 {
-    hit = TriangleHitInfo(GeometryInstanceID(0), 0, float2(0));
-    RayQuery<OpacityEvaluator.RAY_FLAGS> q;
-    q.TraceRayInline(g_scene.tlas, 0, 0xff, ray.to_ray_desc());
-    while (q.Proceed()) {
-        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
-            TriangleHitInfo candidate = TriangleHitInfo(
-                GeometryInstanceID(q.CandidateInstanceID() + q.CandidateGeometryIndex()), q.CandidatePrimitiveIndex(),
-                q.CandidateTriangleBarycentrics());
-            if (opacity.is_valid_hit(ray, candidate, SHADING_HINTS))
-                q.CommitNonOpaqueTriangleHit();
-        }
-    }
-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-        return false;
-    hit = TriangleHitInfo(GeometryInstanceID(q.CommittedInstanceID() + q.CommittedGeometryIndex()),
-                          q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
-    return true;
+    return SceneTraversal.closest_opacity(ray, opacity_seed, hit);
 }
 
-bool occluded_opacity(Ray ray, OpacityEvaluator opacity)
+bool occluded_opacity(Ray ray, uint opacity_seed)
 {
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector(opacity);
-    return intersector.is_occluded(ray, SHADING_HINTS);
+    return SceneTraversal.occluded_opacity(ray, opacity_seed);
 }
 
 /// Visibility ray towards a light sample (the reference path tracer's create_visibility_ray()).
@@ -429,9 +411,8 @@ bool trace_path(Ray ray0, uint slot, inout UniformSampleGenerator sg, out PathRe
                 volume_event = true;
             }
         }
-        OpacityEvaluator opacity = OpacityEvaluator(sg.next_uint());
         TriangleHitInfo hit;
-        if (!intersect_opacity(ray, opacity, hit)) {
+        if (!intersect_opacity(ray, sg.next_uint(), hit)) {
             if (volume_event) {
                 // handle_volume_event(): a scattering vertex in the medium.
                 const HomogeneousMediumProperties medium = interiors.active_medium();
@@ -646,8 +627,8 @@ bool trace_path(Ray ray0, uint slot, inout UniformSampleGenerator sg, out PathRe
             LightSampleContext ctx = hemisphere_light_context(si, sampled_hemispheres);
             if (light_sampler.sample(ctx, sg, ls)
                 && in_sampled_hemispheres(si.front_facing ? si.normal_ws : -si.normal_ws, sampled_hemispheres, ls.dir_ws)) {
-                OpacityEvaluator shadow_opacity = OpacityEvaluator(sg.next_uint());
-                if (!occluded_opacity(light_visibility_ray(si, ls), shadow_opacity)) {
+                uint shadow_opacity_seed = sg.next_uint();
+                if (!occluded_opacity(light_visibility_ray(si, ls), shadow_opacity_seed)) {
                     nee = true;
                     nee_ls = ls;
                     if (light_tracing)
@@ -986,8 +967,10 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
     if (rec.length == 0 && from_camera && any(rec.miss_scale > 0)) {
         // The camera sees the environment map.
         if (backward) {
-            var theta = diffPair(0.0);
-            bwd_diff(env_map_radiance)(theta, rec.miss_dir, weight);
+            if (INCLUDE_SHARED_DERIVATIVES) {
+                var theta = diffPair(0.0);
+                bwd_diff(env_map_radiance)(theta, rec.miss_dir, weight);
+            }
         } else {
             derivative = fwd_diff(env_map_radiance)(diffPair(0.0, 1.0), rec.miss_dir).d;
         }
@@ -999,12 +982,15 @@ float3 differentiate_path(PathRecord rec, bool from_camera, float3 weight, out f
     for (uint k = 0; k < rec.length; k++) {
         const float3 tail = path_vertices[path_index(rec, k)].tail;
         if (backward) {
-            VertexTerms.Differential d;
-            d.emission = weight * prefix;
-            d.nee = weight * prefix;
-            d.step = weight * prefix * tail;
-            var theta = diffPair(0.0);
-            bwd_diff(vertex_terms)(theta, vertex_record(rec, k), from_camera, d);
+            VertexRecord v = vertex_record(rec, k);
+            if ((v.flags & VR_VOLUME) == 0 && backward_material_hit(v.hit)) {
+                VertexTerms.Differential d;
+                d.emission = weight * prefix;
+                d.nee = weight * prefix;
+                d.step = weight * prefix * tail;
+                var theta = diffPair(0.0);
+                bwd_diff(vertex_terms)(theta, v, from_camera, d);
+            }
         } else {
             let d = fwd_diff(vertex_terms)(diffPair(0.0, 1.0), vertex_record(rec, k), from_camera).d;
             derivative += prefix * (d.emission + d.nee + d.step * tail);
