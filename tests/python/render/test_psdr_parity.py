@@ -39,6 +39,9 @@ from .test_adjoint_pathtracer import (_entity, add_box, add_camera, add_mesh, ad
 # OpenPBR scenes do not compile for CUDA (nvrtc 11.6), also in the reference path tracer.
 DEVICE_TYPES = [t for t in helpers.DEFAULT_DEVICE_TYPES if t != spy.DeviceType.cuda]
 FP_MODES = {"default": spy.SlangFloatingPointMode.default, "precise": spy.SlangFloatingPointMode.precise}
+# Precise-mode parity: separate shader pipelines can round float32 results differently. Windows Vulkan (ray_query)
+# needs rtol 8.7e-7 (max_depth 6) and 2.4e-6 (max_depth 16 and 32); a flipped sampling decision differs by far more.
+PRECISE_TOLERANCE = {"rtol": 1e-5, "atol": 1e-8}
 
 
 def standard(scene: f2.Scene, color, roughness: float, metallic: float = 0.0) -> f2.Material:
@@ -147,8 +150,7 @@ def test_psdr_primal_matches_path_tracer(device_type: spy.DeviceType, fp: str, v
     primal = psdr.forward(spp=spp, seed=seed, terms=(), antithetic=False)["primal"]
     bad, ratio = compare(forward, primal, other, f"{fp}/{variant}/{sampler}")
     if fp == "precise":
-        # Separate shader pipelines can round float32 results differently even in precise mode.
-        np.testing.assert_allclose(forward, primal, rtol=1e-6, atol=1e-8, equal_nan=False)
+        np.testing.assert_allclose(forward, primal, **PRECISE_TOLERANCE, equal_nan=False)
     assert bad < 0.01
     assert ratio < 1e-2
 
@@ -168,7 +170,7 @@ def test_psdr_primal_matches_path_tracer_deep(device_type: spy.DeviceType, max_d
     psdr = PSDR(device, scene, camera, max_bounces=max_depth - 1, light_sampler=f2.PowerLightSampler(), rr_depth=None)
     primal = psdr.forward(spp=spp, seed=seed, terms=(), antithetic=False)["primal"]
     compare(forward, primal, other, f"precise/deep {max_depth}")
-    np.testing.assert_allclose(forward, primal, rtol=1e-6, atol=1e-8, equal_nan=False)
+    np.testing.assert_allclose(forward, primal, **PRECISE_TOLERANCE, equal_nan=False)
 
 
 @pytest.mark.parametrize("device_type", DEVICE_TYPES)
