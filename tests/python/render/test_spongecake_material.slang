@@ -6,18 +6,13 @@
 import falcor2.render;
 import falcor2.utils;
 
-bool probe_hit(out IHitInfo hit)
-{
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector();
-    hit = intersector.intersect(Ray(float3(0.0, 3.0, 0.0), float3(0.0, -1.0, 0.0)));
-    return hit.valid;
-}
+#include "material_probe.slangh"
 
 /// (f |cos wo|, pdf) for light arriving from wi (pointing away from the surface) and outgoing direction wo.
 public float4 eval_probe(float3 wi, float3 wo)
 {
-    IHitInfo hit;
-    if (!probe_hit(hit))
+    const IHitInfo hit = probe_hit();
+    if (!hit.valid)
         return float4(-1.0);
     SurfaceInteraction si = g_scene.make_surface_interaction(hit, normalize(wi));
     let mi = g_scene.get_material_instance(hit, si, ExplicitLodSampler(0), MaterialInstanceHints::none);
@@ -29,8 +24,8 @@ public float4 eval_probe(float3 wi, float3 wo)
 /// Sample (weight.rgb, flags) and (wo, pdf) for light arriving from wi.
 public float4 sample_probe(uint tid, float3 wi, uint which)
 {
-    IHitInfo hit;
-    if (!probe_hit(hit))
+    const IHitInfo hit = probe_hit();
+    if (!hit.valid)
         return float4(-1.0);
     SurfaceInteraction si = g_scene.make_surface_interaction(hit, normalize(wi));
     let mi = g_scene.get_material_instance(hit, si, ExplicitLodSampler(0), MaterialInstanceHints::none);

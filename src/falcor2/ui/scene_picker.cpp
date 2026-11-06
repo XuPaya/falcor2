@@ -27,8 +27,8 @@ ScenePicker::ScenePicker(ref<sgl::Device> device)
         .usage = sgl::BufferUsage::unordered_access,
     });
 
-    // Use ray tracing pipeline on CUDA, and compute shader pipeline on other APIs.
-    m_use_raytracing_pipeline = (m_device->type() == sgl::DeviceType::cuda);
+    // Inline ray queries are optional, including on Vulkan devices with ray-tracing pipelines.
+    m_use_raytracing_pipeline = !m_device->has_feature(sgl::Feature::ray_query);
 }
 
 void ScenePicker::create_pipelines(const Scene* scene)

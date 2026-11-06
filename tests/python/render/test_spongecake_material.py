@@ -16,7 +16,6 @@ import slangpy as spy
 
 import falcor2 as f2
 import falcor2.testing.helpers as helpers
-from falcor2.editor import SceneShaderHelper
 
 PROBE_MODULE = str(Path(__file__).with_name("test_spongecake_material.slang"))
 # OpenPBR (any scene material) does not compile for CUDA here; SpongeCake alone would, but keep the device set of
@@ -88,11 +87,8 @@ class Probe:
         material = self.scene.create_material("SpongeCakeMaterial", f2.Properties(values))
         scenes.add_quad_y(self.scene, -1.0, 1.0, -1.0, 1.0, 0.0, material)
         self.scene.update()
-        helper = SceneShaderHelper(device)
-        module = helper.get_module(self.scene, spy.Module.load_from_file(device, PROBE_MODULE))
-        conf = self.scene.requirements.type_conformances
-        self.eval_fn = module.eval_probe.type_conformances(conf).write(helper.bind_scene)
-        self.sample_fn = module.sample_probe.type_conformances(conf).write(helper.bind_scene)
+        self.eval_fn = scenes.probe_function(device, self.scene, "eval_probe", PROBE_MODULE)
+        self.sample_fn = scenes.probe_function(device, self.scene, "sample_probe", PROBE_MODULE)
 
     def eval(self, wi, wo):
         """(f |cos wo|, pdf) for local directions (z = normal)."""
