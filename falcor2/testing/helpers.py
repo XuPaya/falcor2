@@ -20,6 +20,7 @@ from slangpy import (
     SlangCompilerOptions,
     SlangDebugInfoLevel,
     SlangFloatingPointMode,
+    SlangOptimizationLevel,
     Module,
     Logger,
     LogLevel,
@@ -266,6 +267,13 @@ def get_device(
                     else SlangDebugInfoLevel.none
                 ),
                 "floating_point_mode": floating_point_mode,
+                # D3D12: DXC -Od (Slang's level; "-Od" in downstream_args would precede Slang's -O1 and lose). At -O1,
+                # DXC's SimplifyCFG takes hours on the largest PSDR kernels; -Od costs PSDR ~5 % at run time.
+                "optimization": (
+                    SlangOptimizationLevel.none
+                    if type == DeviceType.d3d12
+                    else SlangOptimizationLevel.default
+                ),
             }
         ),
         enable_cuda_interop=cuda_interop,

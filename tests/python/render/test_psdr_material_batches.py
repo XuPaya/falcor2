@@ -10,6 +10,7 @@ import slangpy as spy
 import falcor2 as f2
 import falcor2.testing.helpers as helpers
 from falcor2.psdr import PSDR
+from falcor2.psdr.renderer import MATERIAL_BACKWARD_KERNELS, MATERIAL_FAMILIES
 
 from .test_adjoint_pathtracer import _entity, add_box, add_camera, add_quad_y
 from .test_psdr_trace_ray import DEVICE_TYPES
@@ -235,3 +236,16 @@ def test_mixed_light_tracing_derivatives_and_frame_merging(panels):
     finally:
         psdr.merge_light_frames = True
         psdr.set_light_tracing(paths_per_pixel=0)
+
+
+@pytest.mark.parametrize("device_type", DEVICE_TYPES)
+def test_backward_programs_split_by_material_family(device_type):
+    """With all three families present, every heavy backward kernel runs one program per family on every backend.
+    A program holding all three families' reverse-mode BSDFs took DXC (D3D12) hours to compile."""
+    device = device_for(device_type)
+    scene, camera, *_ = panel_scene(device)
+    psdr = renderer_for(device, scene, camera)
+    expected = tuple((family, i == 0) for i, family in enumerate(MATERIAL_FAMILIES.values()))
+    for name in sorted(MATERIAL_BACKWARD_KERNELS):
+        assert psdr._kernel_specializations(name, True) == expected, name
+        assert psdr._kernel_specializations(name, False) == ((None, True),), name

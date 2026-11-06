@@ -129,7 +129,7 @@ class PSDR:
         type_ids = {c.type_name: c.id for c in conformances if c.interface_name == "IMaterial"}
         self._light_sampler = light_sampler or f2.PowerLightSampler()
         # Query kernels share programs across scenes. Pipeline kernels specialize derivative material families
-        # so absent reverse-mode implementations do not enter the Vulkan program.
+        # so absent reverse-mode implementations do not enter the program.
         use_ray_query = traversal == "ray_query"
         # The scene traversal is a link-time type (traversal.slang), so programs contain TraceRay only with trace_ray.
         prelude = light_sampler_prelude(self._light_sampler) + (
@@ -137,10 +137,10 @@ class PSDR:
             f"{'InlineTraversal' if use_ray_query else 'PipelineTraversal'};\n")
         materials = list(scene.materials)
         self._material_types = frozenset(m.slang_type_name for m in materials)
-        # Keep the large reverse-mode BSDF implementations in separate Vulkan programs when all are present.
+        # Keep the large reverse-mode BSDF implementations in separate programs when all are present: compiling one
+        # program with all three takes DXC (D3D12) hours, and per-family programs build in minutes on D3D12 and Vulkan.
         # The first family pass also owns derivatives that do not belong to a surface vertex.
-        partition_backward = (not use_ray_query and device.info.type == spy.DeviceType.vulkan
-                              and set(MATERIAL_FAMILIES) <= self._material_types)
+        partition_backward = not use_ray_query and set(MATERIAL_FAMILIES) <= self._material_types
         self._backward_material_families = (
             tuple(MATERIAL_FAMILIES.values()) + ((0,) if self._material_types.difference(MATERIAL_FAMILIES) else ())
             if partition_backward else ()

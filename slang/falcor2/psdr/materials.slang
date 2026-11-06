@@ -13,6 +13,10 @@ static const uint MATERIAL_STANDARD = 1;
 static const uint MATERIAL_OPENPBR = 2;
 static const uint MATERIAL_SPONGECAKE = 3;
 
+/// Inlined so Slang folds the link-time family test: each family's backward program then contains only that family's
+/// reverse-mode BSDF code. As a call, the test stays a runtime comparison and DXC compiles all families into every
+/// family's program (hours for the largest kernels).
+[ForceInline]
 bool backward_material_family(uint family)
 {
     return BACKWARD_MATERIAL_FAMILY == 0xffffffff || BACKWARD_MATERIAL_FAMILY == family;
