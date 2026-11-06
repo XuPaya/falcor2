@@ -6,7 +6,7 @@ Status (2026-11-06).
 
 | Platform | Backend | `traversal="auto"` selects | Status |
 |---|---|---|---|
-| Windows | D3D12 | `ray_query` (inline ray queries) | supported, tested; three D3D12-only test failures, see below |
+| Windows | D3D12 | `ray_query` (inline ray queries) | supported, tested; two D3D12-only test failures, one unexplained intermittent one, see below |
 | Linux | Vulkan | `ray_query` if the GPU has it, else `trace_ray` (e.g. GB300) | supported, tested |
 | Windows | Vulkan | `ray_query` | tested 2026-11-06: all PSDR tests pass; not the automatic device type |
 
@@ -22,13 +22,12 @@ python -m pytest tests/python/render -k psdr
 SLANGPY_DEVICE=vulkan python -m pytest tests/python/render -k psdr
 ```
 
-On D3D12 the material-batch and shading-frame kernels now compile in minutes (see "D3D12 compile time"), but three
-D3D12-only failures remain (see "Known failures and limits"; `test_traversals_match` fails only with warm caches);
-deselect them:
+On D3D12 the material-batch and shading-frame kernels now compile in minutes (see "D3D12 compile time"), but two
+D3D12-only failures remain (see "Known failures and limits"); deselect them:
 
 ```
 set SLANGPY_DEVICE=d3d12
-python -m pytest tests/python/render -k "psdr and not split_unsplit and not frame_gradients_match and not traversals_match"
+python -m pytest tests/python/render -k "psdr and not split_unsplit and not frame_gradients_match"
 ```
 
 ## Scene traversal
@@ -81,12 +80,21 @@ Vulkan:
   Tangent gradients appear for an isotropic material, as if `bwd_vertex_attribute()` received the wrong `k`.
 - `test_mixed_split_unsplit_and_accumulation`: the unsplit interior backward pass (`render_interior`, backward,
   per material family) hangs the GPU (`DXGI_ERROR_DEVICE_HUNG`, TDR). Not yet known whether -Od is involved.
-- `test_traversals_match[d3d12]` fails when both persistent test caches (module and shader) are warm: creating the
-  `ray_query` `backward_vertices` pipeline returns `SLANG_FAIL` with no message (slang-rhi reports any failed
-  `NvAPI_D3D12_CreateComputePipelineState` that way). It passes without caches, from a cold cache and with either
-  cache alone (2026-11-06: 3 failures, 4 passes). A reduced scene that compiles both traversals' interior backward
-  passes with both caches warm passes, so the trigger is not known yet. One run of the test fills most of the
-  128 MB RHI cache; the warm run logs `MDB_MAP_FULL`. Run it with `--no-shader-cache` meanwhile.
+- `test_traversals_match[d3d12]` failed three times on 2026-11-05 and has not failed since (12 runs on 2026-11-06:
+  cold and warm caches, the cache state a failing run left, programs new to the driver). Each failing run hit an
+  access violation in native code while dispatching `backward_vertices`; the error was caught and `finish()`
+  returned `SLANG_FAIL` with no message. That dispatch creates the pipeline on first use: Slang and DXC compile the
+  program, then `NvAPI_D3D12_CreateComputePipelineState` compiles it in the driver (slang-rhi discards the NvAPI
+  status). Every failing run needed a first-time driver compile, and the runs passed once the NVIDIA shader cache
+  (`%LOCALAPPDATA%\NVIDIA\DXCache`) held the programs, so the driver is the likely origin. No native stack was
+  captured, and which traversal failed is not known. It looked tied to warm caches because DXIL compiled from cached
+  `.slang-module` files differs from DXIL compiled from source in its debug line info only, which the driver treats
+  as a new program. If it fails again, run it under a debugger that breaks on first-chance access violations.
+- Persistent test caches: the RHI shader cache keys DXIL on the module-cache directory, so a copied cache directory,
+  or a run with `--no-module-cache`, misses every entry. One D3D12 run of `test_traversals_match` writes about
+  159 MB. With the 128 MB default, LRU eviction left a warm run no usable entry, and it took as long as a cold run
+  (about 10 minutes). Test devices now set `shader_cache_size` to 1 GiB (`falcor2.testing.helpers.get_device`; the
+  LMDB file is sparse), and the warm test takes about a minute.
 
 Linux, Vulkan (GB300, driver 615.71.09): no known failures. Precise-mode parity with `trace_ray` is not bit-exact
 (99.4-99.95 % of pixels are identical, the largest difference is 4.8e-7), which the parity tests' tolerance allows.
@@ -122,7 +130,7 @@ Three changes bring the backward programs down to minutes:
 Until 2026-11-06 the `ray_query` programs (shared across scenes) held all three families, so on D3D12 their backward
 kernels took tens of minutes each at `-Od`: 18 minutes for the backward interior term of a Standard-only scene. Split
 per family, the Standard program takes about 1.5 minutes, and `test_traversals_match[d3d12]` completes in 10-18
-minutes from a cold cache.
+minutes from a cold cache and in about a minute from a warm one.
 
 Before these changes (measured 2026-11-05 on an RTX 5090, cold shader cache, one test per process):
 - No result after 8 hours, DXC still compiling: six of the seven `test_psdr_material_batches` tests (all but
@@ -136,4 +144,4 @@ Vulkan builds the same kernels in minutes. These tests were added after PSDR sto
 454babf), so DXC had never compiled them before the link-time traversal type. The other 29 of the 40 D3D12 PSDR tests
 pass, including bit-exact precise parity. Both traversals therefore pass on D3D12 separately (the parity tests use
 `ray_query`, the `test_trace_ray_*` tests `trace_ray`). `test_traversals_match` first completed on D3D12 with the
-`ray_query` family split (2026-11-06), from a cold cache only (see "Known failures and limits").
+`ray_query` family split (2026-11-06; see "Known failures and limits").

@@ -280,6 +280,10 @@ def get_device(
         existing_device_handles=existing_device_handles,
         module_cache_path=module_cache_path,
         shader_cache_path=shader_cache_path,
+        # One D3D12 run of test_traversals_match alone writes ~159 MB (DXIL at -Od with debug info, pipeline blobs).
+        # The 128 MB default evicts LRU entries a warm run still needs, so every kernel recompiled. The LMDB file is
+        # sparse: it uses disk only for what is stored.
+        shader_cache_size=1 << 30,
         additional_vulkan_instance_extensions=additional_vulkan_instance_extensions,
         additional_vulkan_device_extensions=additional_vulkan_device_extensions,
         label=label,
