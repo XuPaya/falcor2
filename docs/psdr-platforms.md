@@ -1,6 +1,6 @@
 # PSDR platforms and tests
 
-Status (2026-11-04).
+Status (2026-11-06).
 
 ## Supported backends
 
@@ -38,13 +38,13 @@ Windows, Vulkan (RTX 5090), not supported:
 - With `ray_query`, NVIDIA's driver rejects the `backward_vertices` pipeline that the interior term uses:
   `CreatePipeline: failed to validate local memory`. This happened at 223d570 too, before the traversal option
   existed. The forward pass and the pixel, primary and secondary terms work. `test_traversals_match[vulkan]` fails.
-- The precise-mode parity tests (`test_psdr_primal_matches_path_tracer[*-precise]`, `..._deep`) assert bit-exact
-  equality with the reference path tracer. On Vulkan PSDR differs in the last bits: up to 4.8e-6 with `ray_query`
-  and 6e-8 with `trace_ray`, on values around 0.4. The default-precision variants, which use a tolerance, pass.
+- The precise-mode parity tests (`test_psdr_primal_matches_path_tracer[*-precise]`, `..._deep`) allow float32
+  rounding against the reference path tracer (rtol 1e-6, atol 1e-8). On Vulkan PSDR differs by up to 4.8e-6 with
+  `ray_query`, on values around 0.4, which exceeds that; `trace_ray` differs by 6e-8, within it.
 
-Linux, Vulkan (GB300, driver 615.71.09):
-- The same precise-mode parity tests fail at the last-bit level with `trace_ray`: 99.4-99.95 % of pixels are
-  identical, and the largest difference is 4.8e-7. Bit-exact parity holds only on D3D12.
+Linux, Vulkan (GB300, driver 615.71.09): no known failures. Precise-mode parity with `trace_ray` is not bit-exact
+(99.4-99.95 % of pixels are identical, the largest difference is 4.8e-7), which the parity tests' tolerance allows.
+Bit-exact parity holds only on D3D12.
 
 Windows, D3D12, compile time: DXC compiles the largest kernels slowly. On a cold shader cache, a single
 `test_psdr_material_batches` test can take over 50 minutes, whichever traversal is used. Vulkan builds the same
