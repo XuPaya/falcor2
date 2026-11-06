@@ -43,6 +43,15 @@ public struct FixedSampleGenerator : ISampleGenerator
     }
 }
 
+public float4 test_mtlx_conty_kulla_sheen_near_normal_eval(float3 wi, float3 wo)
+{
+    mtlx::MxSheenBSDF bsdf = mtlx::MxSheenBSDF(float3(0.8, 0.4, 0.2), 0.5, 0, false);
+    EvalPdfFallbackSampleGenerator sg = EvalPdfFallbackSampleGenerator(0u);
+    BSDFContext bc = {};
+    BSDFEval result = bsdf.eval_with_pdf(wi, wo, sg, bc);
+    return float4(result.value, result.pdf);
+}
+
 public float4 test_anisotropic_ggx_policy()
 {
     AnisotropicGGX alias_zero = AnisotropicGGX(float2(0.0));

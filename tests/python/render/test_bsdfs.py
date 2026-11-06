@@ -996,6 +996,31 @@ def test_bsdf_eval_sample_consistency(
     assert test.run(), test.messages
 
 
+@pytest.mark.parametrize("half_vector_tilt", [0.002, 0.0064])
+def test_mtlx_conty_kulla_sheen_near_normal_eval(
+    _bsdf_resources: _BSDFResources,
+    half_vector_tilt: float,
+) -> None:
+    """Small sheen weights must agree with a double-precision reference near the normal."""
+    wi = np.asarray(WI_30DEG, dtype=np.float64)
+    half_vector = np.array([half_vector_tilt, 0.0, 1.0])
+    half_vector /= np.linalg.norm(half_vector)
+    # Round the direction before computing the reference so both paths use the same inputs.
+    wo = (2.0 * np.dot(wi, half_vector) * half_vector - wi).astype(np.float32)
+    half_vector = wi + wo.astype(np.float64)
+    half_vector /= np.linalg.norm(half_vector)
+    sin_theta_squared = 1.0 - half_vector[2] ** 2
+    distribution = sin_theta_squared * 2.0 / np.pi  # roughness = 0.5
+    visibility = wi[2] * float(wo[2]) / (wi[2] + float(wo[2]) - wi[2] * float(wo[2]))
+    expected = np.array([0.8, 0.4, 0.2]) * distribution * visibility / (4.0 * wi[2])
+
+    result = _bsdf_resources.module["bsdf_tests::test_mtlx_conty_kulla_sheen_near_normal_eval"](
+        wi=WI_30DEG, wo=spy.float3(*wo)
+    )
+    np.testing.assert_allclose(np.asarray(result)[:3], expected, rtol=1e-5, atol=0.0)
+    assert result.w == pytest.approx(1.0 / (2.0 * np.pi), rel=1e-6)
+
+
 def test_mtlx_scratch_conductor_pdf_consistency(
     _bsdf_resources: _BSDFResources,
     _mtlx_lut_bindings: dict[str, Any],
