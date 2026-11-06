@@ -36,7 +36,10 @@ def bumpy_patch(scene, x0, material, n=9):
 
 @pytest.fixture(scope="module", params=DEVICE_TYPES)
 def patches(request):
-    device = helpers.get_device(request.param, floating_point_mode=spy.SlangFloatingPointMode.precise)
+    # Use production-style shader code: debug metadata makes DXC's generated AD kernels much larger.
+    # Keep precise arithmetic and the device's validation layers enabled.
+    device = helpers.get_device(request.param, floating_point_mode=spy.SlangFloatingPointMode.precise,
+                                shader_debug_info=spy.SlangDebugInfoLevel.none)
     if not device.has_feature(spy.Feature.ray_query):
         pytest.skip("Inline ray queries are required")
     scene = f2.Scene.create(device)

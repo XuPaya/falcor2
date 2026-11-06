@@ -13,6 +13,27 @@ static const uint MATERIAL_STANDARD = 1;
 static const uint MATERIAL_OPENPBR = 2;
 static const uint MATERIAL_SPONGECAKE = 3;
 
+// Fold the family choice in Slang, before emitting HLSL. Otherwise DXC still receives every BSDF derivative.
+[ForceInline]
+bool backward_material_family(uint family)
+{
+    return BACKWARD_MATERIAL_FAMILY == 0xffffffff || BACKWARD_MATERIAL_FAMILY == family;
+}
+
+/// Select the differentiated vertex, not its gradient destinations: neighboring vertices and emitters
+/// can belong to other material families. Surface/emission decoding and parameter writes stay scene-wide.
+bool backward_material_hit(HitRef h)
+{
+    if (BACKWARD_MATERIAL_FAMILY == 0xffffffff)
+        return true;
+    MaterialID material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
+    uint type = g_scene.material_system.get_material_data(material).header.type_id;
+    uint family = type == standard_type_id ? MATERIAL_STANDARD
+        : type == openpbr_type_id ? MATERIAL_OPENPBR
+        : type == spongecake_type_id ? MATERIAL_SPONGECAKE : MATERIAL_OTHER;
+    return backward_material_family(family);
+}
+
 /// Non-differentiable shading context of a path vertex, built from the primal incident direction.
 struct Surface
 {
@@ -188,7 +209,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 {
     f1 = float3(0);
     f2 = float3(0);
-    if (s.kind == MATERIAL_STANDARD) {
+    if (backward_material_family(MATERIAL_STANDARD) && s.kind == MATERIAL_STANDARD) {
         UniformSampleGenerator sg = UniformSampleGenerator(0);
         Frame frame = standard_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
@@ -198,9 +219,9 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
             f1 = bsdf.eval(wi_ls, wo_ls1, sg, BSDFContext());
         if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls2, wo2))
             f2 = bsdf.eval(wi_ls, wo_ls2, sg, BSDFContext());
-    } else if (s.kind == MATERIAL_OPENPBR) {
+    } else if (backward_material_family(MATERIAL_OPENPBR) && s.kind == MATERIAL_OPENPBR) {
         eval_openpbr(theta, s, wi_ws, wo1, wo2, f1, f2);
-    } else if (s.kind == MATERIAL_SPONGECAKE) {
+    } else if (backward_material_family(MATERIAL_SPONGECAKE) && s.kind == MATERIAL_SPONGECAKE) {
         Frame frame = spongecake_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
         SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
@@ -228,7 +249,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 [Differentiable]
 float delta_scale(float theta, no_diff Surface s, float3 wi_ws)
 {
-    if (s.kind != MATERIAL_SPONGECAKE)
+    if (!backward_material_family(MATERIAL_SPONGECAKE) || s.kind != MATERIAL_SPONGECAKE)
         return 1.0;
     Frame frame = spongecake_frame(theta, s);
     SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);

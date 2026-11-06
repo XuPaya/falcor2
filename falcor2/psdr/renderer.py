@@ -37,6 +37,8 @@ VERTEX_ITEM_BYTES = 256 << 20
 VERTEX_ITEM_SIZE = 284
 # Backward frame gradients: one FrameItem (interior.slang, FRAME_ITEM_SIZE bytes) per vertex item at most.
 FRAME_ITEM_SIZE = 60
+# Matches MATERIAL_* in materials.slang; other materials still have geometric derivatives.
+MATERIAL_FAMILIES = {"StandardMaterial": 1, "OpenPBRMaterial": 2, "SpongeCakeMaterial": 3}
 # compile_kernels(): (kernel, backward) from the largest program to the smallest.
 COMPILE_ORDER = [("render_light_frames", True), ("render_interior", True), ("render_light", True),
                  ("backward_vertices", True), ("render_light", False), ("render_interior", False),
@@ -106,12 +108,15 @@ class PSDR:
         conformances = scene.requirements.type_conformances
         type_ids = {c.type_name: c.id for c in conformances if c.interface_name == "IMaterial"}
         self._light_sampler = light_sampler or f2.PowerLightSampler()
-        # The kernels depend on the scene only through run-time values (the scene's materials are always all
-        # built-in material types; the light sampler a run-time choice), so other scenes reuse their programs.
+        # Programs are shared across scenes: material conformances contain all built-in types and the light
+        # sampler is a run-time choice. D3D12 vertex derivatives additionally specialize one material family.
         prelude = light_sampler_prelude(self._light_sampler)
 
-        def query(name, backward=False):
-            function = getattr(module, name).constants({"backward": backward}).prelude(prelude)
+        def query(name, backward=False, family=None):
+            constants = {"backward": backward}
+            if family is not None:
+                constants["BACKWARD_MATERIAL_FAMILY"] = family
+            function = getattr(module, name).constants(constants).prelude(prelude)
             return function.type_conformances(conformances).write(self._helper.bind_scene)
 
         self._query = query
@@ -224,7 +229,10 @@ class PSDR:
         # render_interior, as forward mode) and the frames' light paths in merged dispatches.
         self.split_interior = True
         self.merge_light_frames = True
-        # Kernels by (name, backward), compiled on first use (or by compile_kernels()).
+        # D3D12's compiler and driver struggle with the combined reverse-mode BSDFs.
+        # Specialize vertex kernels by family while keeping program keys independent of scene identity.
+        self._vertex_material_families = self._material_families()
+        # Kernels by (name, backward, family), compiled on first use (or by compile_kernels()).
         self._kernels = {}
         self.photon_count = photon_count
         self._upload_scene_state()
@@ -302,6 +310,7 @@ class PSDR:
     def update(self, geometry: bool = True):
         """Refresh the scene-dependent state after ``scene.update()``: light values and, with geometry, the
         edge lists (needed after vertex or transform changes; rebuilt when a pass next samples edges)."""
+        self._vertex_material_families = self._material_families()
         if geometry:
             self._refresh_layout()
             self._edges_stale = True
@@ -646,16 +655,17 @@ class PSDR:
         outputs = ["primal", "interior", "pixel_boundary", "primary_boundary", "secondary_boundary", "light_primal",
                    "light_interior", "vertex_grad", "param_grad", "frame_grad", "vertex_item_count",
                    "frame_item_count"]
-        dispatches = [(name, backward, kwargs) for name, modes, kwargs in kernels for backward in modes
-                      if names is None or name in names]
+        dispatches = [(name, backward, family, kwargs) for name, modes, kwargs in kernels for backward in modes
+                      if names is None or name in names
+                      for family in self._kernel_specializations(name, backward)]
         # Largest programs first (a command list compiles as long as its slowest program; their sizes in inlined HLSL
         # lines order them, ~0.1-0.9 M).
         dispatches.sort(key=lambda d: COMPILE_ORDER.index((d[0], d[1])) if (d[0], d[1]) in COMPILE_ORDER else 99)
         for first in range(0, len(dispatches), max(1, max_parallel)):
             encoder = self.device.create_command_encoder()
             encoder.clear_buffer(self._buffers["vertex_item_count"])
-            for name, backward, kwargs in dispatches[first:first + max(1, max_parallel)]:
-                self._kernel(name, backward).write(self._binder(0, overrides)).append_to(encoder, **kwargs)
+            for name, backward, family, kwargs in dispatches[first:first + max(1, max_parallel)]:
+                self._kernel(name, backward, family).write(self._binder(0, overrides)).append_to(encoder, **kwargs)
             self.device.submit_command_buffer(encoder.finish())
         encoder = self.device.create_command_encoder()
         for name in outputs:
@@ -663,9 +673,9 @@ class PSDR:
         self.device.submit_command_buffer(encoder.finish())
 
     def _backward_interior(self, spp: int, seed: int, antithetic: bool):
-        """The backward interior term in two kernels per chunk of samples and rows: record_interior() writes the camera
-        paths' surface vertices as work items, backward_vertices() differentiates one per thread. Chunks are sized so
-        that their items fit the item buffer even if every path has the maximum length."""
+        """Record paths once per chunk, then differentiate their vertices (one pass per material family on D3D12).
+        Chunks fit the item buffer even if every path has the maximum length. Shared camera-miss derivatives are
+        accumulated by record_interior(); frame adjoints from all vertex passes are chained once afterwards."""
         capacity = self._vertex_item_buffers()
         frames = self._frame_derivatives
         if frames:
@@ -742,10 +752,21 @@ class PSDR:
                 usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
             self._globals["frame_item_capacity"] = capacity
 
-    def _kernel(self, name: str, backward: bool):
-        if (name, backward) not in self._kernels:
-            self._kernels[name, backward] = self._query(name, backward)
-        return self._kernels[name, backward]
+    def _material_families(self) -> tuple[int, ...]:
+        if self.device.info.type != spy.DeviceType.d3d12:
+            return ()
+        return tuple(sorted({MATERIAL_FAMILIES.get(m.slang_type_name, 0) for m in self.scene.materials})) or (0,)
+
+    def _kernel_specializations(self, name: str, backward: bool) -> tuple[Optional[int], ...]:
+        if name == "backward_vertices" and backward and self._vertex_material_families:
+            return self._vertex_material_families
+        return (None,)
+
+    def _kernel(self, name: str, backward: bool, family: Optional[int] = None):
+        key = (name, backward, family)
+        if key not in self._kernels:
+            self._kernels[key] = self._query(name, backward, family)
+        return self._kernels[key]
 
     def _binder(self, seed: int, overrides: Optional[dict] = None):
         def bind(cursor):
@@ -770,7 +791,8 @@ class PSDR:
         return bind
 
     def _call(self, name: str, backward: bool, seed: int, **kwargs):
-        self._kernel(name, backward).write(self._binder(seed))(**kwargs)
+        for family in self._kernel_specializations(name, backward):
+            self._kernel(name, backward, family).write(self._binder(seed))(**kwargs)
 
     def _normal_map_kernels(self) -> bool:
         """Whether the kernels differentiate shading frames through normal maps (see normal_map_derivatives)."""

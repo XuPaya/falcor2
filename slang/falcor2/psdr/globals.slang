@@ -35,6 +35,8 @@ public uint photon_count;
 static float vertex_derivative_limit = 0.0;
 /// Link-time constant selecting backward or forward mode, so each kernel contains one of them.
 public extern static const bool backward;
+/// Heavy BSDF derivative family of a vertex pass, or all families for unspecialized kernels.
+public extern static const uint BACKWARD_MATERIAL_FAMILY = 0xffffffff;
 public uint seed;
 public uint standard_type_id;
 public uint openpbr_type_id;

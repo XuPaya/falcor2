@@ -54,6 +54,7 @@ DEVICE_CACHE: dict[
         Path | None,
         Path | None,
         bool,
+        SlangDebugInfoLevel,
     ],
     Device,
 ] = {}
@@ -214,7 +215,14 @@ def get_device(
     floating_point_mode: SlangFloatingPointMode = SlangFloatingPointMode.default,
     existing_device_handles: Optional[Sequence[NativeHandle]] = None,
     enable_print: bool = False,
+    shader_debug_info: SlangDebugInfoLevel | None = None,
 ) -> Device:
+    """Get a test device, optionally overriding shader debug information for large generated kernels."""
+    if shader_debug_info is None:
+        # Preserve the existing Vulkan workaround: https://github.com/shader-slang/slang/issues/8886
+        shader_debug_info = (
+            SlangDebugInfoLevel.none if type == DeviceType.vulkan else SlangDebugInfoLevel.standard
+        )
     module_cache_path, shader_cache_path = get_module_and_shader_cache_path()
     cache_key = (
         type,
@@ -225,6 +233,7 @@ def get_device(
         module_cache_path,
         shader_cache_path,
         COMPILATION_REPORTS_ENABLED,
+        shader_debug_info,
     )
     if use_cache and cache_key in DEVICE_CACHE:
         return DEVICE_CACHE[cache_key]
@@ -259,12 +268,7 @@ def get_device(
                     PROJECT_ROOT / "tests" / "python",
                     Path(__file__).parent,
                 ],
-                # This is a WAR for https://github.com/shader-slang/slang/issues/8886, to be fixed by https://github.com/shader-slang/slang/pull/8978
-                "debug_info": (
-                    SlangDebugInfoLevel.standard
-                    if type != DeviceType.vulkan
-                    else SlangDebugInfoLevel.none
-                ),
+                "debug_info": shader_debug_info,
                 "floating_point_mode": floating_point_mode,
             }
         ),

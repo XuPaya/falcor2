@@ -122,12 +122,11 @@ Frame interpolated_frame(float theta, no_diff HitRef h, no_diff float handedness
     return Frame(normalize(mul(inverse_transpose, n)), normalize(mul(world_from_object, t)), handedness);
 }
 
-/// Backward mode: the adjoint of the shading frame of the vertex being differentiated (vertex_shading_frame()), its hit
-/// and handedness. backward_vertices() hands it to backward_frames(), which chains it to the stored vertex normals and
-/// tangents in a kernel of its own: in the BSDFs' reverse-mode kernels, that chain makes the SpongeCake kernel of a
-/// Vulkan material-family pass hang.
+/// Backward mode: the adjoint of the shading frame of the vertex being differentiated (vertex_shading_frame()) and its
+/// handedness. backward_vertices() adds the recorded hit and hands it to backward_frames(), which chains it to the
+/// stored vertex normals and tangents in a kernel of its own: in the BSDFs' reverse-mode kernels, that chain makes the
+/// SpongeCake kernel of a Vulkan material-family pass hang.
 static Frame.Differential frame_adjoint;
-static HitRef frame_hit;
 static float frame_handedness;
 static bool frame_pending = false;
 
@@ -156,7 +155,6 @@ void bwd_vertex_shading_frame(inout DifferentialPair<float> theta, HitRef h, Fra
     if (!frame_pending)
         frame_adjoint = Frame.dzero();
     frame_adjoint = Frame.dadd(frame_adjoint, d);
-    frame_hit = h;
     frame_handedness = primal.handedness_sign();
     frame_pending = true;
 }

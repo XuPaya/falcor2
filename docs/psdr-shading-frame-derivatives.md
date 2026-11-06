@@ -157,6 +157,59 @@ gradients are unaffected.
 - The scene toolkit restores UV-aligned tangents (tiled / rotated-anisotropy shapes) only in `update()`; during
   vertex fits the stored tangents are falcor2_inverse's generic ones, which the chain matches.
 
+## D3D12 compilation and frame-record destinations (2026-11-05)
+
+The combined reverse-mode BSDF kernel made DXC's mandatory inlining and subsequent driver compilation extremely
+expensive. Shader debug information amplified the generated program size; disabling optimization did not solve the
+problem. D3D12 now specializes `backward_vertices()` by material family before Slang emits HLSL. The family predicate
+is force-inlined so unused BSDF derivatives are removed before DXC sees them. Each work item is processed by exactly
+one family, including the fallback for other materials. Path recording and camera-miss gradients run once per chunk;
+frame adjoints are accumulated across family passes and chained once afterwards. `PSDR.update()` refreshes the family
+list after scene changes. Material/emission decoding and gradient destinations remain scene-wide, including neighboring
+geometry and lights from other families.
+
+The shading-frame test fixture disables shader debug metadata while retaining precise arithmetic, normal shader
+optimization, and device validation. Other tests retain their existing defaults. `helpers.get_device()` includes the
+debug-info setting in its cache key so devices with different compiler options cannot be confused.
+
+This also exposed a frame-record bug: Standard and OpenPBR adjoints were nonzero, but their recorded geometry ID,
+primitive index, and barycentrics were zero when recovered through the BSDF's custom derivative context. The records
+now take their hit directly from the original `VertexItem`, outside automatic differentiation. The original tests
+check the resulting reverse gradients against forward mode and finite differences for all three families, and check
+accumulation without changing sample counts or tolerances.
+
+Run the four cases on Windows with a new cache directory for a cold compilation measurement, then repeat the command
+to measure cache reuse:
+
+```powershell
+$env:SLANGPY_DEVICE = "d3d12"
+.venv/Scripts/python.exe -m pytest tests/python/render/test_psdr_shading_frames.py -v `
+  --module-and-shader-cache-dir .shader-cache/psdr-frames-d3d12
+```
+
+The optimized shader blobs fit the existing cache limits; increasing the native cache size is unnecessary for these
+tests. On Windows/D3D12 with an RTX A6000, all four cases passed in 455.06 seconds wall time with an empty module/shader
+cache, including process startup and compilation. A fresh process reusing that cache passed in 9.23 seconds, with all
+19 shader and pipeline entries reported as cache hits. These are measurements on that machine, not a time guarantee
+for other hardware or compiler versions.
+
+`tests/python/render/test_psdr_material_dispatch.py` additionally checks fallback-material dispatch and shared
+point/environment light gradients against finite differences before and after material reassignment.
+
+### Full D3D12 validation and related numerical fix
+
+The full rerun used the repository's `.venv` on an RTX A6000, including slow and image tests. All 603 applicable
+native tests and all 21 PSDR tests passed. The Python run recorded 1,296 passes, three failures, 19 skips, and two
+expected failures; 22 CUDA-only Python cases and two CUDA-only native cases were excluded. Serial rechecks passed the
+MaterialX visualizer smoke test that had reported an image-output file I/O error. The remaining failures were the
+adjoint throughput threshold (56.4 FPS versus the required 60 FPS) and MXSheen eval/sample consistency.
+
+Commit `274a865` fixes the MXSheen numerical issue: Conty-Kulla sheen now computes the sine from the normalized
+half-vector's tangential components instead of subtracting its squared normal component from one. This avoids
+cancellation near the normal while retaining the existing consistency tolerance and default compiler arithmetic.
+Both new near-normal evaluation regressions failed before the change; all 12 targeted D3D12 sheen tests passed
+afterward. The full suite has not been repeated after that numerical fix, and the throughput failure remains open.
+
 ## Files
 
 - falcor2: `slang/falcor2/psdr/{geometry,globals,interior,materials,paths,psdr}.slang`, `falcor2/psdr/renderer.py`,

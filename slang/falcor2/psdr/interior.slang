@@ -170,6 +170,8 @@ public void backward_vertices(uint tid)
     if (tid >= min(vertex_item_count.Load(0), vertex_item_capacity))
         return;
     VertexItem item = vertex_items[tid];
+    if (!backward_material_hit(item.v.hit))
+        return;
     vertex_derivative_limit = item.limit;
     VertexTerms.Differential d;
     d.emission = item.d_terms;
@@ -178,7 +180,7 @@ public void backward_vertices(uint tid)
     var theta = diffPair(0.0);
     bwd_diff(vertex_terms)(theta, item.v, true, d);
     if (frame_pending)
-        append_frame_item();
+        append_frame_item(item.v.hit);
 }
 
 /// The adjoint of a vertex's shading frame (frame_adjoint), chained to the stored vertex normals and tangents by
@@ -198,11 +200,13 @@ RWStructuredBuffer<FrameItem> frame_items;
 public RWByteAddressBuffer frame_item_count;
 public uint frame_item_capacity;
 
-void append_frame_item()
+void append_frame_item(HitRef hit)
 {
     frame_pending = false;
     FrameItem item;
-    item.hit = frame_hit;
+    // Keep the destination outside the BSDF's AD context: Slang can discard Surface.hit when it is only
+    // used by a custom backward derivative. The vertex record already has the exact hit being differentiated.
+    item.hit = hit;
     item.handedness = frame_handedness;
     item.limit = vertex_derivative_limit;
     item.d_normal = frame_adjoint.normal;
