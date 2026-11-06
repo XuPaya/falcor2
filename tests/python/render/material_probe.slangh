@@ -1,0 +1,64 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// The surface hit by a vertical ray down the scene's center, for the material probes of the render tests. The
+// traversal is the link-time type ProbeTraversal (probe_function() in test_adjoint_pathtracer.py exports it), so a
+// program contains TraceRay only when it runs as a ray-generation shader: Slang rejects it in compute kernels (E36107).
+
+#include "falcor2/render/scene_ray_tracing.slangh"
+
+public interface IProbeTraversal
+{
+    public static IHitInfo intersect(Ray ray);
+};
+
+/// Inline ray queries.
+public struct InlineProbeTraversal : IProbeTraversal
+{
+    public static IHitInfo intersect(Ray ray)
+    {
+        RayQuerySceneIntersector intersector = RayQuerySceneIntersector();
+        return intersector.intersect(ray);
+    }
+};
+
+/// Ray-tracing pipeline (devices without inline ray queries).
+public struct PipelineProbeTraversal : IProbeTraversal
+{
+    public static IHitInfo intersect(Ray ray)
+    {
+        ProbeHitPayload payload = { {}, OpacityEvaluator(0) };
+        TraceRay(g_scene.tlas, OpacityEvaluator.RAY_FLAGS, 0xff, 0, 0, 0, ray.to_ray_desc(), payload);
+        return payload.hit.unpack();
+    }
+};
+
+public extern struct ProbeTraversal : IProbeTraversal = InlineProbeTraversal;
+
+struct ProbeHitPayload
+{
+    PackedHitInfo hit;
+    OpacityEvaluator opacity;
+};
+
+SCENE_RAY_TYPE_MISS(material_probe, material_probe_miss, ProbeHitPayload);
+void material_probe_miss(inout ProbeHitPayload payload) { payload.hit = {}; }
+
+SCENE_RAY_TYPE_CLOSEST_HIT(material_probe, material_probe_closest_hit, ProbeHitPayload);
+void material_probe_closest_hit<D : IDeferredHitInfo>(inout ProbeHitPayload payload, D deferred_hit)
+{
+    payload.hit = deferred_hit.create().pack();
+}
+
+SCENE_RAY_TYPE_ANY_HIT(material_probe, material_probe_any_hit, ProbeHitPayload);
+void material_probe_any_hit<D : IDeferredHitInfo>(inout ProbeHitPayload payload, D deferred_hit)
+{
+    Ray ray = Ray(WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent());
+    if (!payload.opacity.is_valid_hit(ray, deferred_hit.create(), MaterialInstanceHints::none))
+        IgnoreHit();
+}
+
+IHitInfo probe_hit()
+{
+    return ProbeTraversal.intersect(Ray(float3(0.0, 3.0, 0.0), float3(0.0, -1.0, 0.0)));
+}

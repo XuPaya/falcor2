@@ -10,6 +10,7 @@ import slangpy as spy
 import falcor2 as f2
 import falcor2.testing.helpers as helpers
 from falcor2.editor import RenderMode, SceneShaderHelper
+from falcor2.editor.scene_shader import scene_ray_tracing
 
 WIDTH = 8
 HEIGHT = 8
@@ -96,9 +97,6 @@ def _create_scene(device: spy.Device, transform_scale: spy.float3) -> f2.Scene:
 
 @pytest.mark.parametrize("device_type", helpers.DEFAULT_DEVICE_TYPES)
 def test_render_frame_handedness(device_type: spy.DeviceType) -> None:
-    if device_type == spy.DeviceType.cuda:
-        pytest.skip("The editor debug shader uses ray queries and is not emitted for CUDA.")
-
     device = helpers.get_device(device_type)
     mesh = _create_mirrored_quad()
 
@@ -140,14 +138,20 @@ def test_render_frame_handedness(device_type: spy.DeviceType) -> None:
             label=f"mirrored_{transform_scale.x}_{render_mode.name}",
         )
 
-        module.render_debug_no_ids.type_conformances(scene.requirements.type_conformances).write(
-            helper.bind_scene
-        ).dispatch(
-            thread_count=spy.uint3(WIDTH, HEIGHT, 1),
-            camera=camera,
-            render_mode=int(render_mode),
-            color_output=output,
-        )
+        conformances = scene.requirements.type_conformances
+        if device.has_feature(spy.Feature.ray_query):
+            module.render_debug_no_ids.type_conformances(conformances).write(helper.bind_scene).dispatch(
+                thread_count=spy.uint3(WIDTH, HEIGHT, 1),
+                camera=camera,
+                render_mode=int(render_mode),
+                color_output=output,
+            )
+        else:
+            # The editor's path on devices without inline ray queries.
+            function = module.render_debug_traced.type_conformances(conformances).write(helper.bind_scene)
+            scene_ray_tracing(function, scene, "debug")(
+                ray=camera, render_mode=int(render_mode), _result=output
+            )
         color = output.to_numpy()
         return color[HEIGHT // 2, WIDTH // 2, :3]
 

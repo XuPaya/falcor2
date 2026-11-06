@@ -45,8 +45,6 @@ Windows, Vulkan (RTX 5090), not supported:
 Linux, Vulkan (GB300, driver 615.71.09):
 - The same precise-mode parity tests fail at the last-bit level with `trace_ray`: 99.4-99.95 % of pixels are
   identical, and the largest difference is 4.8e-7. Bit-exact parity holds only on D3D12.
-- `test_psdr_primal_matches_adjoint_tracer[precise|default]`: the driver cannot compile the reference
-  `AdjointPathTracerNode` pipeline (`NVVM compilation failed: 3`). PSDR is not involved.
 
 Windows, D3D12, compile time: DXC compiles the largest kernels slowly. On a cold shader cache, a single
 `test_psdr_material_batches` test can take over 50 minutes, whichever traversal is used. Vulkan builds the same

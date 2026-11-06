@@ -6,6 +6,8 @@ implementing editor;
 import falcor2.render;
 import falcor2.utils;
 
+#include "falcor2/render/scene_ray_tracing.slangh"
+
 enum class RenderMode : uint {
     path_traced,
     shaded,
@@ -163,3 +165,45 @@ public void render_debug_no_ids(
     color_output[tid] = float4(color, 1.0);
 }
 #endif
+
+// ----------------------------------------------------------------------------
+// Ray tracing version (devices without inline ray queries)
+// ----------------------------------------------------------------------------
+
+struct DebugHitPayload
+{
+    PackedHitInfo hit;
+    OpacityEvaluator opacity;
+};
+
+SCENE_RAY_TYPE_MISS(debug, debug_miss, DebugHitPayload);
+void debug_miss(inout DebugHitPayload payload) { payload.hit = {}; }
+
+SCENE_RAY_TYPE_CLOSEST_HIT(debug, debug_closest_hit, DebugHitPayload);
+void debug_closest_hit<D : IDeferredHitInfo>(inout DebugHitPayload payload, D deferred_hit)
+{
+    payload.hit = deferred_hit.create().pack();
+}
+
+SCENE_RAY_TYPE_ANY_HIT(debug, debug_any_hit, DebugHitPayload);
+void debug_any_hit<D : IDeferredHitInfo>(inout DebugHitPayload payload, D deferred_hit)
+{
+    Ray ray = Ray(WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent());
+    if (!payload.opacity.is_valid_hit(ray, deferred_hit.create(), MaterialInstanceHints::none))
+        IgnoreHit();
+}
+
+/// render_debug_no_ids() as a SlangPy kernel (one camera ray per pixel), run as a ray-generation shader.
+public float4 render_debug_traced(Ray ray, uint render_mode)
+{
+    DebugHitPayload payload = { {}, OpacityEvaluator(0) };
+    TraceRay(g_scene.tlas, OpacityEvaluator.RAY_FLAGS, 0xff, 0, 0, 0, ray.to_ray_desc(), payload);
+    IHitInfo hit = payload.hit.unpack();
+
+    float3 color = 0.0;
+    if (hit.valid) {
+        SurfaceInteraction si = g_scene.make_surface_interaction(hit, -ray.dir);
+        color = colorize_hit(hit, si, RenderMode(render_mode));
+    }
+    return float4(color, 1.0);
+}
