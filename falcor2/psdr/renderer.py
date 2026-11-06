@@ -48,6 +48,7 @@ TRACING_KERNELS = {"render_primal", "record_interior", "render_interior", "rende
                    "render_primary", "render_secondary", "render_light", "render_light_frames"}
 # Matches MATERIAL_* in materials.slang; other material types have detached BSDFs but geometric derivatives.
 MATERIAL_FAMILIES = {"StandardMaterial": 1, "OpenPBRMaterial": 2, "SpongeCakeMaterial": 3}
+MATERIAL_OTHER = 0
 MATERIAL_BACKWARD_KERNELS = {"backward_vertices", "render_interior", "render_light", "render_light_frames"}
 
 
@@ -129,7 +130,7 @@ class PSDR:
         type_ids = {c.type_name: c.id for c in conformances if c.interface_name == "IMaterial"}
         self._light_sampler = light_sampler or f2.PowerLightSampler()
         # Query kernels share programs across scenes. Pipeline kernels specialize derivative material families
-        # so absent reverse-mode implementations do not enter the program.
+        # (HAS_*_MATERIAL) so absent reverse-mode implementations do not enter the program.
         use_ray_query = traversal == "ray_query"
         # The scene traversal is a link-time type (traversal.slang), so programs contain TraceRay only with trace_ray.
         prelude = light_sampler_prelude(self._light_sampler) + (
@@ -137,14 +138,19 @@ class PSDR:
             f"{'InlineTraversal' if use_ray_query else 'PipelineTraversal'};\n")
         materials = list(scene.materials)
         self._material_types = frozenset(m.slang_type_name for m in materials)
-        # Keep the large reverse-mode BSDF implementations in separate programs when all are present: compiling one
-        # program with all three takes DXC (D3D12) hours, and per-family programs build in minutes on D3D12 and Vulkan.
-        # The first family pass also owns derivatives that do not belong to a surface vertex.
-        partition_backward = not use_ray_query and set(MATERIAL_FAMILIES) <= self._material_types
-        self._backward_material_families = (
-            tuple(MATERIAL_FAMILIES.values()) + ((0,) if self._material_types.difference(MATERIAL_FAMILIES) else ())
-            if partition_backward else ()
-        )
+        # Keep the large reverse-mode BSDF implementations in separate programs, one pass per family in the scene. A
+        # program with more than one of them can exceed the driver's local memory: NVIDIA's Vulkan driver (Windows)
+        # rejects OpenPBR + SpongeCake ("failed to validate local memory"); DXC (D3D12) compiles all three for hours.
+        # With trace_ray, HAS_*_MATERIAL already leaves a single family's program alone. ray_query programs are shared
+        # across scenes (no HAS_*_MATERIAL), so they always run per family; materials of other types (family
+        # MATERIAL_OTHER) have no reverse-mode BSDFs. The first family pass also owns derivatives that do not belong to
+        # a surface vertex.
+        present = tuple(family for name, family in MATERIAL_FAMILIES.items() if name in self._material_types)
+        other = bool(self._material_types.difference(MATERIAL_FAMILIES))
+        if use_ray_query or len(present) > 1:
+            self._backward_material_families = present + ((MATERIAL_OTHER,) if other or not present else ())
+        else:
+            self._backward_material_families = ()
         material_constants = ({f"HAS_{kind}_MATERIAL": name in self._material_types for kind, name in (
             ("STANDARD", "StandardMaterial"), ("OPENPBR", "OpenPBRMaterial"), ("SPONGECAKE", "SpongeCakeMaterial"))}
             if not use_ray_query else {})

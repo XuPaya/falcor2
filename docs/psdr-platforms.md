@@ -6,9 +6,9 @@ Status (2026-11-06).
 
 | Platform | Backend | `traversal="auto"` selects | Status |
 |---|---|---|---|
-| Windows | D3D12 | `ray_query` (inline ray queries) | supported, tested; two D3D12-only test failures, see below |
+| Windows | D3D12 | `ray_query` (inline ray queries) | supported, tested; three D3D12-only test failures, see below |
 | Linux | Vulkan | `ray_query` if the GPU has it, else `trace_ray` (e.g. GB300) | supported, tested |
-| Windows | Vulkan | `ray_query` | **not supported**: known failures, see below |
+| Windows | Vulkan | `ray_query` | tested 2026-11-06: all PSDR tests pass; not the automatic device type |
 
 SlangPy's automatic device type (falcor2_inverse's `create_device()`, the scene toolkit) already picks D3D12 on
 Windows and Vulkan on Linux. Tests default to every backend of the platform (`falcor2.testing.helpers`), so select
@@ -22,12 +22,13 @@ python -m pytest tests/python/render -k psdr
 SLANGPY_DEVICE=vulkan python -m pytest tests/python/render -k psdr
 ```
 
-On D3D12 the material-batch and shading-frame kernels now compile in minutes (see "D3D12 compile time"), but two
-D3D12-only failures remain (see "Known failures and limits"); deselect them:
+On D3D12 the material-batch and shading-frame kernels now compile in minutes (see "D3D12 compile time"), but three
+D3D12-only failures remain (see "Known failures and limits"; `test_traversals_match` fails only with warm caches);
+deselect them:
 
 ```
 set SLANGPY_DEVICE=d3d12
-python -m pytest tests/python/render -k "psdr and not split_unsplit and not frame_gradients_match"
+python -m pytest tests/python/render -k "psdr and not split_unsplit and not frame_gradients_match and not traversals_match"
 ```
 
 ## Scene traversal
@@ -40,17 +41,38 @@ reach a compute kernel: Slang rejects it there for HLSL and SPIR-V (E36107, "use
 'compute' stage"). Before the link-time type, a branch on a link-time constant left `TraceRay` in the inline
 programs, and PSDR with `ray_query` did not compile on Windows (D3D12 or Vulkan).
 
+## Material-family programs
+
+The reverse-mode BSDF code of the differentiable material families is large. The SPIR-V of `backward_vertices` holds
+24 / 146 / 184 KB of function-scope variables with only Standard / SpongeCake / OpenPBR, and 335 KB with all three.
+NVIDIA's Vulkan driver on Windows (RTX 5090, 591.86) rejects a program with the OpenPBR and SpongeCake reverse modes
+together, with either traversal (`CreatePipeline: failed to validate local memory`); Standard + OpenPBR builds. These
+kernels trace no rays, so ray queries are not the cause. DXC (D3D12) compiles all three in one program for hours (see
+"D3D12 compile time").
+
+The heavy backward kernels (`MATERIAL_BACKWARD_KERNELS`: `backward_vertices`, `render_interior`, `render_light`,
+`render_light_frames`) therefore run one program per material family present in the scene
+(`PSDR._backward_material_families`, link-time constant `BACKWARD_MATERIAL_FAMILY`):
+- `trace_ray`: when two or more families are present. With one, `HAS_*_MATERIAL` already leaves only its code.
+- `ray_query`: always. Its programs are shared across scenes (no `HAS_*_MATERIAL`), so each holds one family; a scene
+  runs only its own families' passes.
+
+Materials of other types get a pass of their own (`MATERIAL_OTHER`, no reverse-mode BSDF), as does a `ray_query` scene
+without a differentiable family. The first pass also owns the derivatives that do not belong to a surface vertex. The
+path-tracing kernels (`render_interior` unsplit, `render_light`, `render_light_frames`) trace the paths again in each
+pass, so a scene with k families runs k backward passes of them; `backward_vertices` passes only re-read the recorded
+vertices. Until 2026-11-06 the split applied to `trace_ray` with all three families only, so `ray_query` backward
+failed on Windows Vulkan (`test_traversals_match[vulkan]`), and so did `trace_ray` with OpenPBR + SpongeCake.
+
 ## Known failures and limits
 
-Windows, Vulkan (RTX 5090, driver 591.86), not supported:
-- With `ray_query`, NVIDIA's driver rejects the `backward_vertices` pipeline that the interior term uses:
-  `CreatePipeline: failed to validate local memory`. This happened at 223d570 too, before the traversal option
-  existed. The forward pass and the pixel, primary and secondary terms work. `test_traversals_match[vulkan]` fails.
+Windows, Vulkan (RTX 5090, driver 591.86): no known failures.
 - Precise-mode parity with `ray_query` is not bit-exact. The parity tests (`test_psdr_primal_matches_path_tracer[*-precise]`,
   `..._deep`) need rtol 8.7e-7 at max_depth 6 and 2.4e-6 at max_depth 16 and 32 (largest absolute difference 6.7e-6,
   on bright pixels); their tolerance (rtol 1e-5, atol 1e-8) allows that. `trace_ray` differs by 6e-8.
 
-Windows, D3D12 (RTX 5090), found 2026-11-05 once the kernels compiled; both pass on Windows Vulkan:
+Windows, D3D12 (RTX 5090), found 2026-11-05 and 2026-11-06 once the kernels compiled; the first two pass on Windows
+Vulkan:
 - Frame gradients (`backward(frame_gradients=True)`) are wrong on D3D12 for StandardMaterial and OpenPBRMaterial:
   `test_frame_gradients_match_finite_differences_and_forward_mode[*-StandardMaterial|OpenPBRMaterial]` fail
   (Standard: reverse -0.0188 vs forward and finite difference +0.0035; OpenPBR: reverse 0, its gradients land on
@@ -59,6 +81,12 @@ Windows, D3D12 (RTX 5090), found 2026-11-05 once the kernels compiled; both pass
   Tangent gradients appear for an isotropic material, as if `bwd_vertex_attribute()` received the wrong `k`.
 - `test_mixed_split_unsplit_and_accumulation`: the unsplit interior backward pass (`render_interior`, backward,
   per material family) hangs the GPU (`DXGI_ERROR_DEVICE_HUNG`, TDR). Not yet known whether -Od is involved.
+- `test_traversals_match[d3d12]` fails when both persistent test caches (module and shader) are warm: creating the
+  `ray_query` `backward_vertices` pipeline returns `SLANG_FAIL` with no message (slang-rhi reports any failed
+  `NvAPI_D3D12_CreateComputePipelineState` that way). It passes without caches, from a cold cache and with either
+  cache alone (2026-11-06: 3 failures, 4 passes). A reduced scene that compiles both traversals' interior backward
+  passes with both caches warm passes, so the trigger is not known yet. One run of the test fills most of the
+  128 MB RHI cache; the warm run logs `MDB_MAP_FULL`. Run it with `--no-shader-cache` meanwhile.
 
 Linux, Vulkan (GB300, driver 615.71.09): no known failures. Precise-mode parity with `trace_ray` is not bit-exact
 (99.4-99.95 % of pixels are identical, the largest difference is 4.8e-7), which the parity tests' tolerance allows.
@@ -78,9 +106,9 @@ hours; DXC v1.9.2609 behaves the same. Standalone `dxc.exe` on the dumped HLSL (
 | `backward_vertices` | > 4997, stopped | 1305 | 1158 |
 | `render_light_frames` | > 5000, stopped | 2441 | 1661 |
 
-Three changes bring the `trace_ray` programs down to minutes:
-- The heavy backward kernels run one program per material family on every backend when all three families are present
-  (`PSDR._backward_material_families`; this used to be Vulkan only).
+Three changes bring the backward programs down to minutes:
+- The heavy backward kernels run one program per material family on every backend (see "Material-family programs";
+  this used to be Vulkan only).
 - `backward_material_family()` is `[ForceInline]`, so Slang folds the link-time family test and each family's program
   keeps only that family's reverse-mode code (`backward_vertices`: 0.65 / 0.67 / 1.98 MB of HLSL for Standard /
   SpongeCake / OpenPBR instead of 2.54 MB each). Without it the split programs are as large as the combined one.
@@ -91,9 +119,10 @@ Three changes bring the `trace_ray` programs down to minutes:
   interior 83.7 -> 87.6 ms on a 128x128 Standard scene at 64 spp; same primal, gradients equal to 1e-6).
   Devices outside the tests (falcor2_inverse's `create_device()`) still use `-O1`.
 
-`ray_query` programs are shared across scenes and always contain all three families (the `HAS_*_MATERIAL`
-constants and the family split apply to `trace_ray` only), so on D3D12 their backward kernels still take tens of
-minutes each at `-Od`.
+Until 2026-11-06 the `ray_query` programs (shared across scenes) held all three families, so on D3D12 their backward
+kernels took tens of minutes each at `-Od`: 18 minutes for the backward interior term of a Standard-only scene. Split
+per family, the Standard program takes about 1.5 minutes, and `test_traversals_match[d3d12]` completes in 10-18
+minutes from a cold cache.
 
 Before these changes (measured 2026-11-05 on an RTX 5090, cold shader cache, one test per process):
 - No result after 8 hours, DXC still compiling: six of the seven `test_psdr_material_batches` tests (all but
@@ -106,4 +135,5 @@ Before these changes (measured 2026-11-05 on an RTX 5090, cold shader cache, one
 Vulkan builds the same kernels in minutes. These tests were added after PSDR stopped compiling on D3D12 (58b099b and
 454babf), so DXC had never compiled them before the link-time traversal type. The other 29 of the 40 D3D12 PSDR tests
 pass, including bit-exact precise parity. Both traversals therefore pass on D3D12 separately (the parity tests use
-`ray_query`, the `test_trace_ray_*` tests `trace_ray`), but `test_traversals_match` has not completed there.
+`ray_query`, the `test_trace_ray_*` tests `trace_ray`). `test_traversals_match` first completed on D3D12 with the
+`ray_query` family split (2026-11-06), from a cold cache only (see "Known failures and limits").

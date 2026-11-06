@@ -10,7 +10,7 @@ import slangpy as spy
 import falcor2 as f2
 import falcor2.testing.helpers as helpers
 from falcor2.psdr import PSDR
-from falcor2.psdr.renderer import MATERIAL_BACKWARD_KERNELS, MATERIAL_FAMILIES
+from falcor2.psdr.renderer import MATERIAL_BACKWARD_KERNELS, MATERIAL_FAMILIES, MATERIAL_OTHER
 
 from .test_adjoint_pathtracer import _entity, add_box, add_camera, add_quad_y
 from .test_psdr_trace_ray import DEVICE_TYPES
@@ -23,14 +23,14 @@ def device_for(device_type):
     return device
 
 
-def materials_for(scene):
+def materials_for(scene, families=tuple(MATERIAL_FAMILIES)):
     definitions = [
         ("StandardMaterial", "base_color_factor", {"roughness_factor": 0.8}),
         ("OpenPBRMaterial", "base_color", {"specular_roughness": 0.8}),
         ("SpongeCakeMaterial", "albedo", {"roughness": 0.8, "thickness": 1.0, "base_weight": 0.0}),
     ]
     return [(scene.create_material(family, f2.Properties({parameter: spy.float3(0.5), **properties})), parameter)
-            for family, parameter, properties in definitions]
+            for family, parameter, properties in definitions if family in families]
 
 
 def panel_scene(device):
@@ -238,14 +238,66 @@ def test_mixed_light_tracing_derivatives_and_frame_merging(panels):
         psdr.set_light_tracing(paths_per_pixel=0)
 
 
+def family_scene(device, families, other=False):
+    """Panels of the given material families (and a StandardSpecGlossMaterial panel with other=True)."""
+    scene = f2.Scene.create(device)
+    materials = [material for material, _ in materials_for(scene, families)]
+    if other:
+        materials.append(scene.create_material(f2.StandardSpecGlossMaterial, f2.Properties({
+            "diffuse_factor": spy.float3(0.5), "specular_factor": spy.float3(0), "glossiness_factor": 0.2})))
+    for i, material in enumerate(materials):
+        x0 = -3 + 6 * i / len(materials)
+        add_quad_y(scene, x0, x0 + 6 / len(materials), -3, 3, 0, material)
+    camera = add_camera(scene, (0, 3, 0), (0, 0, 0), (0, 0, 1), 45, 12, 8)
+    scene.update()
+    return scene, camera
+
+
 @pytest.mark.parametrize("device_type", DEVICE_TYPES)
 def test_backward_programs_split_by_material_family(device_type):
-    """With all three families present, every heavy backward kernel runs one program per family on every backend.
-    A program holding all three families' reverse-mode BSDFs took DXC (D3D12) hours to compile."""
+    """Every heavy backward kernel runs one program per material family whenever a program could hold more than one
+    family's reverse-mode BSDFs: all three took DXC (D3D12) hours to compile, and NVIDIA's Vulkan driver (Windows)
+    rejects a program with OpenPBR and SpongeCake ("failed to validate local memory"). With trace_ray a single
+    family keeps one program (HAS_*_MATERIAL); ray_query programs are shared across scenes, so they always split."""
     device = device_for(device_type)
-    scene, camera, *_ = panel_scene(device)
+    standard, openpbr, spongecake = MATERIAL_FAMILIES.values()
+    cases = [("trace_ray", tuple(MATERIAL_FAMILIES), False, ((standard, True), (openpbr, False), (spongecake, False))),
+             ("trace_ray", ("OpenPBRMaterial", "SpongeCakeMaterial"), False, ((openpbr, True), (spongecake, False))),
+             ("trace_ray", ("OpenPBRMaterial", "SpongeCakeMaterial"), True,
+              ((openpbr, True), (spongecake, False), (MATERIAL_OTHER, False))),
+             ("trace_ray", ("SpongeCakeMaterial",), True, ((None, True),)),
+             ("trace_ray", ("OpenPBRMaterial",), False, ((None, True),))]
+    if device.has_feature(spy.Feature.ray_query):
+        cases += [("ray_query", ("OpenPBRMaterial",), False, ((openpbr, True),)),
+                  ("ray_query", ("StandardMaterial",), True, ((standard, True), (MATERIAL_OTHER, False))),
+                  ("ray_query", (), True, ((MATERIAL_OTHER, True),)),
+                  ("ray_query", tuple(MATERIAL_FAMILIES), False,
+                   ((standard, True), (openpbr, False), (spongecake, False)))]
+    for traversal, families, other, expected in cases:
+        scene, camera = family_scene(device, families, other)
+        psdr = PSDR(device, scene, camera, max_bounces=1, light_sampler=f2.UniformLightSampler(), traversal=traversal)
+        for name in sorted(MATERIAL_BACKWARD_KERNELS):
+            label = f"{traversal} {families} other={other} {name}"
+            assert psdr._kernel_specializations(name, True) == expected, label
+            assert psdr._kernel_specializations(name, False) == ((None, True),), label
+
+
+@pytest.mark.parametrize("device_type", DEVICE_TYPES)
+def test_two_family_backward_derivatives(device_type):
+    """OpenPBR and SpongeCake without StandardMaterial: before the per-family split for two families, trace_ray
+    compiled both reverse-mode BSDFs into one backward program, which NVIDIA's Vulkan driver (Windows) rejected."""
+    device = device_for(device_type)
+    scene = f2.Scene.create(device)
+    materials = materials_for(scene, ("OpenPBRMaterial", "SpongeCakeMaterial"))
+    for (x0, x1), (material, _) in zip(((-3, 0), (0, 3)), materials):
+        add_quad_y(scene, x0, x1, -3, 3, 0, material)
+    light = _entity(scene, (-0.5, 2, 0.7)).create_component(f2.PointLight)
+    light.intensity = spy.float3(3)
+    camera = add_camera(scene, (0, 3, 0), (0, 0, 0), (0, 0, 1), 45, 12, 8)
+    scene.update()
     psdr = renderer_for(device, scene, camera)
-    expected = tuple((family, i == 0) for i, family in enumerate(MATERIAL_FAMILIES.values()))
-    for name in sorted(MATERIAL_BACKWARD_KERNELS):
-        assert psdr._kernel_specializations(name, True) == expected, name
-        assert psdr._kernel_specializations(name, False) == ((None, True),), name
+    _, params = backward(psdr)
+    for material, parameter in materials:
+        slot = psdr.material_slot(material, parameter)
+        numerical = difference(scene, psdr, lambda value: material.__setitem__(parameter, spy.float3(value)), 0.5)
+        check_derivative(params[slot:slot + 3].sum(), numerical, material.slang_type_name)
