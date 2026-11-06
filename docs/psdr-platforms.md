@@ -42,13 +42,15 @@ programs, and PSDR with `ray_query` did not compile on Windows (D3D12 or Vulkan)
 
 ## Known failures and limits
 
-Windows, Vulkan (RTX 5090), not supported:
+Windows, Vulkan (RTX 5090, driver 591.86), not supported:
 - With `ray_query`, NVIDIA's driver rejects the `backward_vertices` pipeline that the interior term uses:
   `CreatePipeline: failed to validate local memory`. This happened at 223d570 too, before the traversal option
   existed. The forward pass and the pixel, primary and secondary terms work. `test_traversals_match[vulkan]` fails.
 - The precise-mode parity tests (`test_psdr_primal_matches_path_tracer[*-precise]`, `..._deep`) allow float32
-  rounding against the reference path tracer (rtol 1e-6, atol 1e-8). On Vulkan PSDR differs by up to 4.8e-6 with
-  `ray_query`, on values around 0.4, which exceeds that; `trace_ray` differs by 6e-8, within it.
+  rounding against the reference path tracer (rtol 1e-6, atol 1e-8). With `ray_query` the six
+  `test_psdr_primal_matches_path_tracer[*-precise]` variants pass, but `test_psdr_primal_matches_path_tracer_deep[16]`
+  and `[32]` fail: PSDR differs by up to 4.8e-6 on values around 0.4, and 5 of 12288 values exceed the tolerance
+  (largest violation 1.1e-6 absolute, 2.4e-6 relative). `trace_ray` differs by 6e-8, within it.
 
 Windows, D3D12 (RTX 5090), found 2026-11-05 once the kernels compiled; both pass on Windows Vulkan:
 - Frame gradients (`backward(frame_gradients=True)`) are wrong on D3D12 for StandardMaterial and OpenPBRMaterial:
