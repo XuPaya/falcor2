@@ -40,6 +40,24 @@ def bind_light_sampler(cursor, sampler: fc.LightSampler):
         block["power"] = sampler
 
 
+def scene_ray_tracing(function: Any, scene: fc.Scene, ray_type: str, max_ray_payload_size: int = 32) -> Any:
+    """Runs a SlangPy function as a ray-generation shader that traces the scene with one ray type: the miss, closest-hit
+    and any-hit shaders its module defines with the SCENE_RAY_TYPE_* macros (falcor2/render/scene_ray_tracing.slangh).
+    For devices without inline ray queries. The hit groups are part of the call signature: cache the result."""
+    ray = fc.SceneRayTracingSetup.RayDesc()
+    ray.name = ray_type
+    ray.has_miss = ray.has_closest_hit = ray.has_any_hit = True
+    setup = fc.SceneRayTracingSetup.create(scene, [ray])
+    return function.ray_tracing(
+        hit_groups=setup.hit_groups,
+        hit_group_names=setup.sbt_hit_group_names,
+        miss_entry_points=setup.sbt_miss_entry_points,
+        max_recursion=1,
+        max_ray_payload_size=max_ray_payload_size,
+        flags=setup.pipeline_flags,
+    )
+
+
 class SceneShaderHelper:
     """Load and cache a slang module linked with a scene's render module and requirements."""
 

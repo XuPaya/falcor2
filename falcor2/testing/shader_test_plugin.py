@@ -219,18 +219,30 @@ def _strip_test_prefix(func_name: str) -> str:
     return func_name[len(_TEST_CASE_PREFIX) :]
 
 
-def _generate_dispatcher_source(func_names: list[str]) -> str:
+def _generate_dispatcher_source(func_names: list[str], device_type: spy.DeviceType) -> str:
     """Generate a compute entry point that dispatches to individual test functions."""
     cases = "\n".join(f"        case {i}: {name}(); break;" for i, name in enumerate(func_names))
+    # CUDA emits an invalid __ldg() for a bare uniform scalar. D3D12 needs that scalar:
+    # with an explicit constant buffer, Slang 2026.16.1 can emit a b1 CBV absent from the
+    # root signature in modules importing falcor2.render (e.g. test_interior_list.slang).
+    if device_type == spy.DeviceType.d3d12:
+        declaration = "uniform uint _test_case_index;\n"
+        index = "_test_case_index"
+    else:
+        declaration = (
+            "struct TestCaseParams { uint index; };\n"
+            "ConstantBuffer<TestCaseParams> _test_case;\n"
+        )
+        index = "_test_case.index"
     return (
         f"\n// Auto-generated dispatcher entry point\n"
-        f"uniform uint _test_case_index;\n"
+        f"{declaration}"
         f'[shader("compute")]\n'
         f"[numthreads(1, 1, 1)]\n"
         f"void {_DISPATCHER_ENTRY_POINT}("
         f"uint3 _tid: SV_DispatchThreadID)\n"
         f"{{\n"
-        f"    switch (_test_case_index)\n"
+        f"    switch ({index})\n"
         f"    {{\n"
         f"{cases}\n"
         f"    }}\n"
@@ -272,7 +284,7 @@ def _get_or_compile_dispatcher(
         return cached
 
     source = path.read_text(encoding="utf-8")
-    dispatcher = _generate_dispatcher_source(func_names)
+    dispatcher = _generate_dispatcher_source(func_names, device_type)
     combined = source + "\n" + dispatcher
 
     session = _create_slang_session(device)
@@ -338,7 +350,11 @@ def run_shader_test_batched(
         device,
         cached.kernel,
         _strip_test_prefix(func_names[test_case_index]),
-        extra_vars={"_test_case_index": test_case_index},
+        extra_vars=(
+            {"_test_case_index": test_case_index}
+            if device_type == spy.DeviceType.d3d12
+            else {"_test_case": {"index": test_case_index}}
+        ),
     )
 
 

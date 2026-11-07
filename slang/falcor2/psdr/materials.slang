@@ -13,10 +13,37 @@ static const uint MATERIAL_STANDARD = 1;
 static const uint MATERIAL_OPENPBR = 2;
 static const uint MATERIAL_SPONGECAKE = 3;
 
+/// Inlined so Slang folds the link-time family test: each family's backward program then contains only that family's
+/// reverse-mode BSDF code. As a call, the test stays a runtime comparison and DXC compiles all families into every
+/// family's program (hours for the largest kernels).
+[ForceInline]
+bool backward_material_family(uint family)
+{
+    return BACKWARD_MATERIAL_FAMILY == 0xffffffff || BACKWARD_MATERIAL_FAMILY == family;
+}
+
+/// Select the current vertex only. Its derivative may still write to neighboring vertices or an emitter of
+/// another family, so neither geometry/parameter writes nor surface/emission decoding are filtered.
+bool backward_material_hit(HitRef h)
+{
+    if (BACKWARD_MATERIAL_FAMILY == 0xffffffff)
+        return true;
+    MaterialID material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
+    uint type = g_scene.material_system.get_material_data(material).header.type_id;
+    uint family = type == standard_type_id ? MATERIAL_STANDARD
+        : type == openpbr_type_id ? MATERIAL_OPENPBR
+        : type == spongecake_type_id ? MATERIAL_SPONGECAKE : MATERIAL_OTHER;
+    return backward_material_family(family);
+}
+
 /// Non-differentiable shading context of a path vertex, built from the primal incident direction.
 struct Surface
 {
     SurfaceInteraction si;
+    HitRef hit;
+    /// The shading frame follows the stored vertex normals and tangents (frame_derivatives, camera-path vertices;
+    /// light-path vertices keep constant frames: no geometric derivatives along light paths).
+    bool vertex_frame;
     MaterialID material;
     uint kind;
     uint slot;
@@ -32,17 +59,18 @@ Surface make_surface(HitRef h, float3 wi_ws, float exterior_ior = 1.0)
     Surface s = {};
     s.si = g_scene.make_triangle_surface_interaction(TriangleHitInfo(h.gid, h.prim, h.bary), wi_ws);
     s.si.exterior_ior = exterior_ior;
+    s.hit = h;
     s.material = g_scene.get_geometry_instance_desc(h.gid).header.material_id;
     s.slot = uint(s.material) * MATERIAL_SLOTS;
     MaterialData data = g_scene.material_system.get_material_data(s.material);
-    if (data.header.type_id == standard_type_id) {
+    if (HAS_STANDARD_MATERIAL && data.header.type_id == standard_type_id) {
         s.kind = MATERIAL_STANDARD;
         s.standard = reinterpret<StandardMaterial>(data);
         s.standard_instance = s.standard.setup_material_instance(s.si, ExplicitLodSampler(), SHADING_HINTS);
-    } else if (data.header.type_id == openpbr_type_id) {
+    } else if (HAS_OPENPBR_MATERIAL && data.header.type_id == openpbr_type_id) {
         s.kind = MATERIAL_OPENPBR;
         s.openpbr = reinterpret<OpenPBRMaterial>(data);
-    } else if (data.header.type_id == spongecake_type_id) {
+    } else if (HAS_SPONGECAKE_MATERIAL && data.header.type_id == spongecake_type_id) {
         s.kind = MATERIAL_SPONGECAKE;
         s.spongecake = reinterpret<SpongeCakeMaterial>(data);
     }
@@ -55,15 +83,17 @@ IMaterialInstance material_instance(Surface s)
 }
 
 /// Shading frame with the material's normal map (texels and scale differentiable), as in the materials'
-/// setup_material_instance() with SHADING_HINTS.
+/// setup_material_instance() with SHADING_HINTS. With s.vertex_frame, the interpolated frame is differentiable with
+/// respect to the stored vertex normals and tangents.
 [Differentiable]
 Frame shading_frame(float theta, no_diff Surface s, no_diff uint normal_texture, no_diff float4 sampled, float scale,
                     no_diff bool orient_backface)
 {
-    Frame frame = s.si.shading_frame_ws;
+    Frame frame = vertex_shading_frame(theta, s.hit, s.si.shading_frame_ws, s.vertex_frame);
     if (RawTextureHandle(normal_texture).is_valid()) {
         float3 n = stdmat::decode_normal_map(texture_param(theta, normal_texture, s.si.uv, sampled).xyz);
         n = normalize(lerp(float3(0.0, 0.0, 1.0), n, scale));
+        n = normal_maps ? n : detach(n);
         frame = Frame(frame.to_global(n), frame.tangent, no_diff s.si.shading_frame_ws.handedness_sign());
     }
     frame = stdmat::orient_shading_frame(s.si, frame, orient_backface);
@@ -75,7 +105,7 @@ Frame shading_frame(float theta, no_diff Surface s, no_diff uint normal_texture,
     if (detach(cos_theta) <= 0.1)
         frame = Frame(normalize(sign_n * lerp(ng, sign_n * frame.normal, saturate(cos_theta * 10.0))), frame.tangent,
                       no_diff detach(frame).handedness_sign());
-    return normal_maps ? frame : detach(frame);
+    return normal_maps || s.vertex_frame ? frame : detach(frame);
 }
 
 [Differentiable]
@@ -181,7 +211,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 {
     f1 = float3(0);
     f2 = float3(0);
-    if (s.kind == MATERIAL_STANDARD) {
+    if (HAS_STANDARD_MATERIAL && backward_material_family(MATERIAL_STANDARD) && s.kind == MATERIAL_STANDARD) {
         UniformSampleGenerator sg = UniformSampleGenerator(0);
         Frame frame = standard_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
@@ -191,17 +221,21 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
             f1 = bsdf.eval(wi_ls, wo_ls1, sg, BSDFContext());
         if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls2, wo2))
             f2 = bsdf.eval(wi_ls, wo_ls2, sg, BSDFContext());
-    } else if (s.kind == MATERIAL_OPENPBR) {
+    } else if (HAS_OPENPBR_MATERIAL && backward_material_family(MATERIAL_OPENPBR) && s.kind == MATERIAL_OPENPBR) {
         eval_openpbr(theta, s, wi_ws, wo1, wo2, f1, f2);
-    } else if (s.kind == MATERIAL_SPONGECAKE) {
+    } else if (HAS_SPONGECAKE_MATERIAL && backward_material_family(MATERIAL_SPONGECAKE) && s.kind == MATERIAL_SPONGECAKE) {
         Frame frame = spongecake_frame(theta, s);
         float3 wi_ls = frame.to_local(wi_ws), wo_ls1 = frame.to_local(wo1), wo_ls2 = frame.to_local(wo2);
         SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
         Frame primal = detach(frame);
-        // Both directions through one call site (the evaluation's derivative code is instantiated once).
+        // Keep one derivative call site for DXC; Vulkan needs unrolling for correct reverse-mode loops.
         float3 f[2] = { float3(0), float3(0) };
+#if defined(__TARGET_D3D12__)
         [MaxIters(2)]
         [loop]
+#else
+        [ForceUnroll]
+#endif
         for (uint d = 0; d < 2; d++) {
             float3 wo = d == 0 ? wo1 : wo2, wo_ls = d == 0 ? wo_ls1 : wo_ls2;
             if (no_diff stdmat::is_valid_hemisphere_reflection_or_transmission(s.si, primal, wi_ls, wo_ls, wo))
@@ -221,7 +255,7 @@ void eval_bsdf(float theta, no_diff Surface s, float3 wi_ws, float3 wo1, float3 
 [Differentiable]
 float delta_scale(float theta, no_diff Surface s, float3 wi_ws)
 {
-    if (s.kind != MATERIAL_SPONGECAKE)
+    if (!HAS_SPONGECAKE_MATERIAL || !backward_material_family(MATERIAL_SPONGECAKE) || s.kind != MATERIAL_SPONGECAKE)
         return 1.0;
     Frame frame = spongecake_frame(theta, s);
     SpongeCakeBSDF bsdf = spongecake_bsdf(theta, s);
@@ -243,11 +277,11 @@ float3 eval_emission(float theta, no_diff Surface s, float3 normal, float3 to_ws
 {
     if (dot(detach(normal), detach(to_ws)) <= 0 && !emits_both_sides(s))
         return float3(0);
-    if (s.kind == MATERIAL_STANDARD)
+    if (HAS_STANDARD_MATERIAL && s.kind == MATERIAL_STANDARD)
         return texture_param(theta, s.standard.emissive_texture.data, s.si.uv,
                              s.standard.emissive_texture.sample(ExplicitLodSampler(), s.si.uv, float4(1.0))).rgb
             * param3(theta, s.standard.emissive_factor, s.slot + 6);
-    if (s.kind == MATERIAL_OPENPBR)
+    if (HAS_OPENPBR_MATERIAL && s.kind == MATERIAL_OPENPBR)
         return openpbr_emission(theta, s);
     return other;
 }

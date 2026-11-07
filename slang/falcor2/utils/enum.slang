@@ -10,6 +10,13 @@ public bool is_set<T : __EnumType>(T value, T flag)
     return value & flag;
 }
 
+/// Test flags represented by unsigned integer bitmasks.
+[ForceInline]
+public bool is_set(uint value, uint flag)
+{
+    return (value & flag) != 0;
+}
+
 /// Toggle flag in value.
 public void flip_bit<T : __EnumType>(inout T value, T flag)
 {

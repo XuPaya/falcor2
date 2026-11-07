@@ -7,10 +7,11 @@
 import falcor2.render;
 import falcor2.utils;
 
+#include "material_probe.slangh"
+
 public float transmittance_probe(uint tid, float3 wi)
 {
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector();
-    const IHitInfo hit = intersector.intersect(Ray(float3(0.0, 3.0, 0.0), float3(0.0, -1.0, 0.0)));
+    const IHitInfo hit = probe_hit();
     if (!hit.valid)
         return -1.0;
     const float3 dir = normalize(wi);
@@ -28,8 +29,7 @@ public float transmittance_probe(uint tid, float3 wi)
 /// The same transmittance by integrating eval() over the transmission hemisphere (uniform directions).
 public float transmittance_probe_eval(uint tid, float3 wi)
 {
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector();
-    const IHitInfo hit = intersector.intersect(Ray(float3(0.0, 3.0, 0.0), float3(0.0, -1.0, 0.0)));
+    const IHitInfo hit = probe_hit();
     if (!hit.valid)
         return -1.0;
     const float3 dir = normalize(wi);
@@ -47,8 +47,7 @@ public float transmittance_probe_eval(uint tid, float3 wi)
 /// away from the light, wo = toward the light), i.e. the flux transmitted from a collimated beam along -wi_light.
 public float transmittance_probe_reverse(uint tid, float3 wi)
 {
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector();
-    const IHitInfo hit = intersector.intersect(Ray(float3(0.0, 3.0, 0.0), float3(0.0, -1.0, 0.0)));
+    const IHitInfo hit = probe_hit();
     if (!hit.valid)
         return -1.0;
     const float3 light = normalize(wi);
@@ -69,8 +68,7 @@ public float transmittance_probe_reverse(uint tid, float3 wi)
 /// view direction wo (world space; wi of the interaction = the camera side wo, as the path tracer evaluates it).
 public float3 bsdf_probe_eval(float3 wi_light, float3 wo)
 {
-    RayQuerySceneIntersector intersector = RayQuerySceneIntersector();
-    const IHitInfo hit = intersector.intersect(Ray(float3(0.0, 3.0, 0.0), float3(0.0, -1.0, 0.0)));
+    const IHitInfo hit = probe_hit();
     if (!hit.valid)
         return float3(-1.0);
     SurfaceInteraction si = g_scene.make_surface_interaction(hit, normalize(wo));

@@ -54,12 +54,16 @@ DEVICE_CACHE: dict[
         Path | None,
         Path | None,
         bool,
+        SlangDebugInfoLevel,
     ],
     Device,
 ] = {}
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 DEFAULT_MODULE_AND_SHADER_CACHE_DIR = PROJECT_ROOT / ".shader-cache" / "tests"
+# A full PSDR traversal/material matrix exceeds SGL's 128 MiB default. Keep the
+# persistent cache large enough to retain compiled programs for a fresh-process rerun.
+TEST_SHADER_CACHE_SIZE = 2 * 1024 * 1024 * 1024
 MODULE_CACHE_ENABLED = False
 SHADER_CACHE_ENABLED = False
 COMPILATION_REPORTS_ENABLED = False
@@ -214,7 +218,14 @@ def get_device(
     floating_point_mode: SlangFloatingPointMode = SlangFloatingPointMode.default,
     existing_device_handles: Optional[Sequence[NativeHandle]] = None,
     enable_print: bool = False,
+    shader_debug_info: SlangDebugInfoLevel | None = None,
 ) -> Device:
+    """Get a test device, optionally overriding shader debug information for large generated kernels."""
+    if shader_debug_info is None:
+        # Preserve the existing Vulkan workaround: https://github.com/shader-slang/slang/issues/8886
+        shader_debug_info = (
+            SlangDebugInfoLevel.none if type == DeviceType.vulkan else SlangDebugInfoLevel.standard
+        )
     module_cache_path, shader_cache_path = get_module_and_shader_cache_path()
     cache_key = (
         type,
@@ -225,6 +236,7 @@ def get_device(
         module_cache_path,
         shader_cache_path,
         COMPILATION_REPORTS_ENABLED,
+        shader_debug_info,
     )
     if use_cache and cache_key in DEVICE_CACHE:
         return DEVICE_CACHE[cache_key]
@@ -259,12 +271,7 @@ def get_device(
                     PROJECT_ROOT / "tests" / "python",
                     Path(__file__).parent,
                 ],
-                # This is a WAR for https://github.com/shader-slang/slang/issues/8886, to be fixed by https://github.com/shader-slang/slang/pull/8978
-                "debug_info": (
-                    SlangDebugInfoLevel.standard
-                    if type != DeviceType.vulkan
-                    else SlangDebugInfoLevel.none
-                ),
+                "debug_info": shader_debug_info,
                 "floating_point_mode": floating_point_mode,
             }
         ),
@@ -272,6 +279,7 @@ def get_device(
         existing_device_handles=existing_device_handles,
         module_cache_path=module_cache_path,
         shader_cache_path=shader_cache_path,
+        shader_cache_size=TEST_SHADER_CACHE_SIZE,
         additional_vulkan_instance_extensions=additional_vulkan_instance_extensions,
         additional_vulkan_device_extensions=additional_vulkan_device_extensions,
         label=label,

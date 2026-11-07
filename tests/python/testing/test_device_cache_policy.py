@@ -66,3 +66,26 @@ def test_get_device_enables_compilation_reports_for_telemetry(monkeypatch: Any) 
         helpers.configure_test_device_options()
 
     assert created[0]["enable_compilation_reports"] is True
+
+
+def test_shader_debug_options_use_distinct_cached_devices(monkeypatch: Any) -> None:
+    created: list[dict[str, Any]] = []
+
+    def create_device(**kwargs: Any) -> SimpleNamespace:
+        created.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(helpers, "Device", create_device)
+    monkeypatch.setattr(helpers, "DEVICE_CACHE", {})
+    default = helpers.get_device(helpers.DeviceType.d3d12)
+    no_debug = helpers.get_device(
+        helpers.DeviceType.d3d12, shader_debug_info=helpers.SlangDebugInfoLevel.none
+    )
+    assert no_debug is not default
+    assert helpers.get_device(helpers.DeviceType.d3d12) is default
+    assert helpers.get_device(
+        helpers.DeviceType.d3d12, shader_debug_info=helpers.SlangDebugInfoLevel.none
+    ) is no_debug
+    assert len(created) == 2
+    assert created[0]["compiler_options"].debug_info == helpers.SlangDebugInfoLevel.standard
+    assert created[1]["compiler_options"].debug_info == helpers.SlangDebugInfoLevel.none

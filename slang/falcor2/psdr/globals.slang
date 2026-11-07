@@ -35,12 +35,28 @@ public uint photon_count;
 static float vertex_derivative_limit = 0.0;
 /// Link-time constant selecting backward or forward mode, so each kernel contains one of them.
 public extern static const bool backward;
+// Keep absent reverse-mode material implementations out of the trace_ray programs.
+public extern static const bool HAS_STANDARD_MATERIAL = true;
+public extern static const bool HAS_OPENPBR_MATERIAL = true;
+public extern static const bool HAS_SPONGECAKE_MATERIAL = true;
+/// Heavy BSDF derivative family of this pass, or all families. Surface/emitter decoding remains scene-wide.
+public extern static const uint BACKWARD_MATERIAL_FAMILY = 0xffffffff;
+/// Camera misses and light-source emission do not belong to a surface vertex; accumulate them in one pass.
+public extern static const bool INCLUDE_SHARED_DERIVATIVES = true;
 public uint seed;
 public uint standard_type_id;
 public uint openpbr_type_id;
 public uint spongecake_type_id;
-/// Whether materials have normal maps. Without them, shading frames are detached (constant).
+/// Whether materials have normal maps. Without them (and without frame_derivatives), shading frames are detached
+/// (constant).
 public bool normal_maps;
+/// Whether the shading frames of camera-path vertices follow the stored vertex normals and tangents they interpolate
+/// (vertex_attribute()): forward mode reads their tangents from frame_tangent, backward mode accumulates their
+/// gradients into frame_grad. Off: the stored frames are constant (the vertex derivatives hold them fixed).
+public bool frame_derivatives;
+/// Backward mode: the frame gradients are bounded by vertex_derivative_limit x frame_limit_scale (the scene extent:
+/// the vertex bound per unit normal change instead of per unit length).
+public float frame_limit_scale;
 public uint light_slot_base;
 public extern struct LightSampler : ILightSampler = PowerLightSampler;
 public ParameterBlock<LightSampler> light_sampler;
@@ -51,6 +67,10 @@ public StructuredBuffer<float> param_tangent;
 /// Object-space vertex gradients (float3 per vertex) and parameter gradients (backward mode).
 public RWByteAddressBuffer vertex_grad;
 public RWByteAddressBuffer param_grad;
+/// Object-space tangents (forward mode: 2 float3 per vertex) and gradients (backward mode: 6 floats per vertex) of
+/// the stored vertex normals and shading tangents, in that order (see frame_derivatives).
+public StructuredBuffer<float3> frame_tangent;
+public RWByteAddressBuffer frame_grad;
 /// Emission property (intensity or radiance) of each light, in LightID order.
 public StructuredBuffer<float3> light_value;
 /// First texel parameter slot of each texture by TextureHandle.texture_index, or NO_SLOT: four slots (RGBA)

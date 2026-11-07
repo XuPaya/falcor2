@@ -24,8 +24,8 @@ public struct MxContyKullaSheenMtx
 
     public float D(float3 Hr)
     {
-        float cos_theta = Hr.z;
-        float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+        // Avoid cancellation near the normal; Hr is normalized.
+        float sin_theta = sqrt(max(0.0, dot(Hr.xy, Hr.xy)));
         return pow(sin_theta, 1.0 / roughness) * (2.0 + 1.0 / roughness) * float.INV_TWO_PI;
     }
 
